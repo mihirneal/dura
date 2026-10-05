@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dura"
+version = "0.1.0"
+description = "Dura: restricted-access structural MRI evals for brain foundation models"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "einops",
+    "jaxtyping",
+    "nibabel",
+    "numpy",
+    "scikit-learn",
+    "torch",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+
+nanobrain = [
+    "nanobrain",
+]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+nanobrain = { path = "../nanobrain", editable = true }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+ignore = ["F722"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

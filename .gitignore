@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+_version.py
+
+# IDE
+.vscode/
+
+# Virtual environment
+.venv/
+# too many conflicts
+uv.lock
+
+# Environment variables
+.env
+.env.*
+
+# Local scratch/tmp
+.scratch
+tmp
+.tmp*
+
+# AI assistants
+.claude/
+
+# Misc
+.DS_Store
+
+# Subdirectories
+/third_party/
