@@ -1,8 +1,4 @@
-"""Build the ADNI eval data from manifest.tsv.
-
-The nii.gz stay exactly as converted from the release, symlinked in as
-images/sub-<id>/ses-<date>/<name>. Each task gets <task>.tsv: the subject, its image path relative
-to the output dir, and the target, recomputed from the tables (see adni.py).
+"""Symlink the manifest's images and write each task's <task>.tsv with targets.
 
     uv run --group datasets python datasets/adni/make_dataset.py /data/smri-datasets/ADNI \
         /data/mihir-stuff/dura/adni
@@ -23,7 +19,7 @@ MANIFEST = Path(__file__).parent / "manifest.tsv"
 
 
 def read_error(path: Path) -> str | None:
-    """Decompress the whole image, so a truncated download fails here rather than mid eval."""
+    """Full read, to catch truncated files."""
     try:
         np.asarray(nib.load(path).dataobj)
     except (OSError, EOFError, ValueError, zlib.error, ImageFileError) as exc:

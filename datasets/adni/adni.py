@@ -1,13 +1,5 @@
-"""The ADNI eval cohorts, shared by make_manifest.py and make_dataset.py.
-
-Images are the local DICOM to NIfTI conversion of the ADNI release (nifti/, with a dcm2niix sidecar
-per image), labels come from the ADNIMERGE2 tables of the 18 Jun 2026 download. Only 3T scans
-from ADNIGO on are used: ADNI1 is mostly 1.5T, with an older protocol and no FLAIR. Field strength
-comes from the sidecars, because LONI's MRI key table has no row for about 2k of the T1s.
-
-Each task has its own subjects, at most MAX_SUBJECTS, with one scan each, so CV folds never share
-a subject. Subjects are sampled with a fixed seed.
-"""
+"""ADNI eval cohorts: 3T scans from ADNIGO on, labels from the 18 Jun 2026 ADNIMERGE2 tables.
+One scan per subject, at most MAX_SUBJECTS per task."""
 
 import json
 import re
@@ -28,19 +20,16 @@ MAX_SUBJECTS = 500
 SAMPLE_SEED = 0
 DX_MAX_DAYS = 90
 CONVERSION_YEARS = 3.0
-# stable MCI needs follow-up to the horizon, give or take a visit window
 CONVERSION_MIN_FOLLOWUP_YEARS = CONVERSION_YEARS - 0.25
-# log of WMH as a percent of cranial volume, the offset for the few scans with none
 WMH_LOG_OFFSET = 0.01
-# FreeSurfer 7 aseg volumes, left and right. The temporal horns are the inferior lateral ventricles
+# FreeSurfer 7 aseg, left and right. temporal horns = inferior lateral ventricles
 REGIONS = {
     "hippocampus": ("ST29SV", "ST88SV"),
     "amygdala": ("ST12SV", "ST71SV"),
     "temporal_horns": ("ST30SV", "ST89SV"),
     "lateral_ventricles": ("ST37SV", "ST96SV"),
 }
-# and their SynthSeg labels, to check FreeSurfer: a run is left out if any region's volume is off
-# from SynthSeg's by more than MAX_DISAGREEMENT robust SDs of the usual ratio between the two
+# SynthSeg labels, to drop FreeSurfer runs off by > MAX_DISAGREEMENT robust SDs
 SYNTHSEG_REGIONS = {
     "hippocampus": ("left hippocampus", "right hippocampus"),
     "amygdala": ("left amygdala", "right amygdala"),
@@ -52,7 +41,7 @@ MIN_SYNTHSEG_QC = 0.65
 FREESURFER_MAX_DAYS = 30
 AMYLOID_MAX_DAYS = 365
 
-# broken on disk, found by eye: noise without a brain, though UC Davis has a WMH volume for its id
+# noise, no brain
 BAD_IMAGES = {"sub-019S4835_ses-20170719_run-02_FLAIR.nii.gz"}
 
 IMAGE_NAME = re.compile(
@@ -73,8 +62,7 @@ def read_table(raw_root: Path, name: str) -> pd.DataFrame:
 
 
 def read_image(raw_root: Path, name: str) -> dict:
-    """Scanner metadata from the dcm2niix sidecar. A 3T image is valid if nibabel reads it as 3D
-    with a sane affine."""
+    """Scanner metadata from the dcm2niix sidecar, and whether a 3T image loads as 3D."""
     path = image_path(raw_root, name)
     try:
         meta = json.loads(path.with_name(name.replace(".nii.gz", ".json")).read_text())
@@ -95,7 +83,6 @@ def read_image(raw_root: Path, name: str) -> dict:
     return {
         "tesla": tesla,
         "acquisition": meta.get("MRAcquisitionType"),
-        # no gradient distortion correction on the scanner. ADNI3 also stores the corrected one
         "nd": "ND" in meta.get("ImageType", []),
         "repeat": "repeat" in description,
         "accel": bool(re.search(r"accel|grappa|sense|\bcs\b", description)),
@@ -104,9 +91,7 @@ def read_image(raw_root: Path, name: str) -> dict:
 
 
 def index_images(raw_root: Path) -> pd.DataFrame:
-    """Every valid 3T T1w and FLAIR, one row per nii.gz. Series that converted to several files
-    (multi-echo and slice spacing variants: acq- names, or several outputs in the log) are left
-    out."""
+    """Every valid 3T T1w and FLAIR, skipping series converted to several files."""
     log = pd.read_csv(raw_root / "nifti" / "conversion_log.tsv", sep="\t")
     log = log[log.status.isin(["ok", "skipped"]) & ~log.output.str.contains(";")]
     names = log.output.str.rsplit("/", n=1).str[-1]
@@ -125,8 +110,7 @@ def index_images(raw_root: Path) -> pd.DataFrame:
 
 
 def select_t1(images: pd.DataFrame) -> pd.DataFrame:
-    """One T1 per session: distortion corrected before ND, first scan before repeat, full before
-    accelerated (ADNIGO/2 acquired both), lowest run."""
+    """One T1 per session: corrected over ND, first over repeat, full over accelerated."""
     t1 = images[images.suffix == "T1w"]
     t1 = t1.sort_values(["subject", "date", "nd", "repeat", "accel", "run"])
     return t1.drop_duplicates(["subject", "date"]).reset_index(drop=True)
@@ -135,7 +119,7 @@ def select_t1(images: pd.DataFrame) -> pd.DataFrame:
 def nearest(
     left: pd.DataFrame, right: pd.DataFrame, left_on: str, right_on: str, max_days: int
 ) -> pd.DataFrame:
-    """For each left row, the right row of the same RID nearest in date, if within max_days."""
+    """Nearest right row of the same RID within max_days."""
     left = left.assign(**{left_on: left[left_on].astype("datetime64[ns]")})
     right = right.assign(**{right_on: right[right_on].astype("datetime64[ns]")})
     return pd.merge_asof(
@@ -160,9 +144,7 @@ def diagnoses(raw_root: Path) -> pd.DataFrame:
 
 
 def mci_conversion(sessions: pd.DataFrame, dx: pd.DataFrame) -> pd.DataFrame:
-    """MCI sessions with a known outcome. Converter: a dementia diagnosis within CONVERSION_YEARS
-    of the scan. Stable: no dementia diagnosis within the horizon and a diagnosis visit at it or
-    later, reverters to CN included. Sessions followed for less time are left out."""
+    """MCI sessions with dementia within CONVERSION_YEARS, or followed that long."""
     mci = sessions[sessions.DIAGNOSIS == "MCI"][["RID", "subject", "date"]]
     later = mci.merge(dx, on="RID")
     years = (later.dx_date - later.date).dt.days / 365.25
@@ -176,10 +158,7 @@ def mci_conversion(sessions: pd.DataFrame, dx: pd.DataFrame) -> pd.DataFrame:
 
 
 def wmh(raw_root: Path, images: pd.DataFrame, t1: pd.DataFrame) -> pd.DataFrame:
-    """Sessions with UC Davis WMH volumes, on the exact FLAIR they were measured on, and a
-    selected T1. 3D FLAIR only: ADNIGO/2 FLAIR is 2D with 5mm slices, on which UC Davis measures
-    about twice as much WMH at the same age, and a model can read the slice thickness off the
-    image."""
+    """UC Davis WMH on the FLAIR it was measured on. 3D FLAIR only: 2D FLAIR inflates WMH."""
     ucd = read_table(raw_root, "UCD_WMH")
     ucd = ucd[ucd.STATUS.isna()].dropna(subset=["IMAGEUID", "TOTAL_WMH", "CEREBRUM_TCV"])
     ucd = ucd.assign(image_id="I" + ucd.IMAGEUID.astype(int).astype(str))
@@ -202,8 +181,7 @@ def demographics(raw_root: Path) -> pd.DataFrame:
 
 
 def freesurfer_volumes(raw_root: Path) -> pd.DataFrame:
-    """UCSF FreeSurfer 7 volumes of the REGIONS, left + right, and the ICV of 3T runs. Most runs
-    were never rated visually, so only those rated as failed are left out."""
+    """FreeSurfer 7 REGIONS volumes and ICV of 3T runs not rated as failed."""
     fs = read_table(raw_root, "UCSFFSX7").dropna(subset=["EXAMDATE", "ST10CV"])
     fs = fs[fs.FIELD_STRENGTH.astype(str) == "3T"]
     ratings = fs[["OVERALLQC", "HIPPOQC", "VENTQC"]].astype(str)
@@ -216,15 +194,13 @@ def freesurfer_volumes(raw_root: Path) -> pd.DataFrame:
 
 
 def session(name: str) -> tuple[str, pd.Timestamp]:
-    """Subject and session date from a sub-<subject>_ses-<date>_... file name."""
+    """(subject, date) of a sub-<subject>_ses-<date>_... name."""
     match = re.search(r"sub-(\w+?)_ses-(\d{8})_", name)
     return match[1], pd.Timestamp(match[2])
 
 
 def synthseg_volumes(raw_root: Path, sessions: set[tuple[str, pd.Timestamp]]) -> pd.DataFrame:
-    """Volumes of each session's best SynthSeg T1 run (synthseg/ in the release), if its QC
-    passes, indexed by (subject, date). SynthSeg ran on an earlier conversion with its own run
-    numbers, so runs are matched by session, not by image."""
+    """Volumes of each session's best SynthSeg run, matched by session, not run number."""
     qc_files = defaultdict(list)
     for path in (raw_root / "synthseg").glob("sub-*_T1w*_qc.csv"):
         key = session(path.name)
@@ -245,8 +221,7 @@ def synthseg_volumes(raw_root: Path, sessions: set[tuple[str, pd.Timestamp]]) ->
 
 
 def agrees_with_synthseg(raw_root: Path, volumes: pd.DataFrame) -> np.ndarray:
-    """Whether each FreeSurfer run's regional volumes agree with SynthSeg on the same session.
-    False without a SynthSeg run that passes QC."""
+    """Whether each FreeSurfer run agrees with SynthSeg on the same session."""
     keys = list(zip(volumes.subject, volumes.date))
     synthseg = synthseg_volumes(raw_root, set(keys)).reindex(keys)
     agrees = np.ones(len(volumes), dtype=bool)
@@ -272,8 +247,7 @@ def amyloid_status(raw_root: Path) -> pd.DataFrame:
 
 
 def w_scores(sessions: pd.DataFrame, reference: pd.DataFrame) -> pd.DataFrame:
-    """Each region's log volume relative to normal aging: the residual of a linear fit on age,
-    sex and log ICV in the reference sessions, in units of the reference residual SD."""
+    """Log volume residual of a fit on age, sex and log ICV in the reference, in reference SDs."""
 
     def design(table: pd.DataFrame) -> np.ndarray:
         return np.c_[np.ones(len(table)), table.age, table.male, np.log(table.icv)]
@@ -288,8 +262,7 @@ def w_scores(sessions: pd.DataFrame, reference: pd.DataFrame) -> pd.DataFrame:
 
 
 def regional_volumes(raw_root: Path, sessions: pd.DataFrame) -> pd.DataFrame:
-    """First sessions with FreeSurfer volumes that agree with SynthSeg, and their regional
-    W-scores against amyloid negative CN sessions (amyloid PET within AMYLOID_MAX_DAYS)."""
+    """First sessions whose FreeSurfer volumes agree with SynthSeg, as W-scores."""
     volumes = nearest(
         sessions, freesurfer_volumes(raw_root), "date", "fs_date", FREESURFER_MAX_DAYS
     ).dropna(subset=list(REGIONS))
@@ -321,8 +294,7 @@ def balanced_sample(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def cohorts(raw_root: Path) -> dict[str, pd.DataFrame]:
-    """Each task's subjects: subject, image as a nii.gz name, and target.
-    Each subject's first eligible session, then at most MAX_SUBJECTS subjects per task."""
+    """Each task's subject, image and target."""
     images = index_images(raw_root)
     t1 = select_t1(images)
     dx = diagnoses(raw_root)
@@ -331,17 +303,15 @@ def cohorts(raw_root: Path) -> dict[str, pd.DataFrame]:
     key = ["subject", "date"]
     t1_names = t1[[*key, "name"]]
 
-    # balanced classes, the sanity check would otherwise be mostly CN and MCI
     diagnosis = balanced_sample(first_session(sessions))
     diagnosis = diagnosis.assign(target=diagnosis.DIAGNOSIS.map(DIAGNOSES))
-    # every converter, the scarce class, and a sample of the stable
+    # every converter
     conversion = first_session(sessions[[*key, "name"]].merge(mci_conversion(sessions, dx), on=key))
     converted = conversion[conversion.target == 1]
     stable = sample(conversion[conversion.target == 0], MAX_SUBJECTS - len(converted))
     conversion = pd.concat([converted, stable])
     wmh_sessions = first_session(t1_names.merge(wmh(raw_root, images, t1), on=key))
     wmh_sessions = sample(wmh_sessions, min(MAX_SUBJECTS, len(wmh_sessions)))
-    # one sample for all regions, balanced so that disease spreads the volumes
     volumes = balanced_sample(regional_volumes(raw_root, sessions))
 
     tables = {

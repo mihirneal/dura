@@ -1,9 +1,6 @@
-"""Freeze the subjects and images of the ADNI evals as manifest.tsv.
+"""Freeze each task's subjects and images as manifest.tsv.
 
-One row per task and subject, with the nii.gz name of its image, see adni.py for how each task
-picks them.
-
-    uv run --group datasets python datasets/adni/make_manifest.py /data/smri-datasets/ADNI
+uv run --group datasets python datasets/adni/make_manifest.py /data/smri-datasets/ADNI
 """
 
 import argparse

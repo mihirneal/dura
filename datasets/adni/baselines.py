@@ -1,11 +1,5 @@
-"""Classical reference scores for the ADNI evals, on the same subjects and scored like the
-linear probes (dura.probe), so model scores have context.
-
-- age+sex at the scan
-- SynthSeg: log regional volumes from synthseg/ in the release, each session's best QC run
-- FreeSurfer WM hypo: FreeSurfer 7's T1 white matter hypointensity volume (UCSFFSX7), for WMH
-
-Subjects missing a feature are left out of that score.
+"""Reference scores (age+sex, SynthSeg volumes, FreeSurfer WM hypointensities), probed like
+the models.
 
     uv run --group datasets python datasets/adni/baselines.py /data/smri-datasets/ADNI
 """

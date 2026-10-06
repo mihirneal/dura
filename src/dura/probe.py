@@ -56,9 +56,7 @@ def probe_multiclass_classification(
     amp: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
-    Linear probe for classification into labels 0..K-1 on the global embedding. Multinomial
-    logistic regression with the penalty tuned by inner CV. Scores pooled out-of-fold predictions
-    by macro one-vs-rest AUROC and balanced accuracy, with bootstrap CIs.
+    Linear probe for labels 0..K-1 on the global embedding, scored by macro one-vs-rest AUROC.
     """
     return probe_global(
         fit_score_multiclass,
@@ -111,7 +109,7 @@ def probe_global(
     device: str,
     amp: bool,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Embed the samples with the global embedding and score them with fit_score."""
+    """Global embeddings scored with fit_score."""
     features, targets, embed_seconds = embed_global(
         model, transform, samples, batch_size, num_workers, device, amp
     )
@@ -131,8 +129,7 @@ def embed_global(
     device: str,
     amp: bool,
 ) -> tuple[np.ndarray, np.ndarray, float]:
-    """Global embeddings [N D] and targets [N] of the samples in order, and the seconds spent in
-    global_embed."""
+    """Global embeddings [N D], targets [N] and seconds spent embedding."""
     device_type = torch.device(device).type
     model.eval()
     fit_transform(transform, samples)
@@ -157,8 +154,7 @@ def embed_global(
 
 
 def fit_score_binary(features: np.ndarray, labels: np.ndarray, n_folds: int = 5) -> dict[str, Any]:
-    """Logistic regression on fixed features, fit in n_folds CV, pooled out-of-fold predictions
-    scored with bootstrap CIs. The probe's scoring, also used for the classical baselines."""
+    """Logistic regression in n_folds CV, pooled out-of-fold scores with bootstrap CIs."""
     assert set(np.unique(labels)) == {0, 1}, "expected binary labels"
     n_samples = len(labels)
     probabilities = np.zeros(n_samples)
@@ -198,9 +194,7 @@ def fit_score_binary(features: np.ndarray, labels: np.ndarray, n_folds: int = 5)
 def fit_score_multiclass(
     features: np.ndarray, labels: np.ndarray, n_folds: int = 5
 ) -> dict[str, Any]:
-    """Multinomial logistic regression on fixed features for labels 0..K-1, fit in n_folds CV,
-    pooled out-of-fold predictions scored by macro one-vs-rest AUROC and balanced accuracy with
-    bootstrap CIs."""
+    """Multinomial logistic regression, scored like fit_score_binary."""
     n_classes = len(np.unique(labels))
     assert n_classes > 2 and set(np.unique(labels)) == set(range(n_classes)), (
         "expected labels 0..K-1 with K > 2, use probe_binary_classification for two classes"
@@ -244,8 +238,7 @@ def fit_score_multiclass(
 def fit_score_regression(
     features: np.ndarray, targets: np.ndarray, n_folds: int = 5
 ) -> dict[str, Any]:
-    """Ridge regression on fixed features with the penalty tuned by leave-one-out, fit in
-    n_folds CV, pooled out-of-fold predictions scored with bootstrap CIs."""
+    """Ridge in n_folds CV, pooled out-of-fold scores with bootstrap CIs."""
     targets = np.asarray(targets, dtype=np.float64)
     n_samples = len(targets)
     predictions = np.zeros(n_samples)
@@ -289,7 +282,7 @@ def logistic_classifier() -> Pipeline:
             Cs=LOGISTIC_CS,
             l1_ratios=(0.0,),
             scoring="neg_log_loss",
-            # so that 0.5 (argmax for multiclass) is a sensible cutoff for balanced accuracy
+            # so 0.5 / argmax is a sensible cutoff
             class_weight="balanced",
             max_iter=1000,
             use_legacy_attributes=False,
