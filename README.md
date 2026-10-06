@@ -32,12 +32,49 @@ The releases sit behind logins or data use agreements, so each one is downloaded
 | Dataset | Tasks | Metric |
 |---|---|---|
 | ucsf_bmsr | `ucsf_bmsr_t1c_enhancing`, `ucsf_bmsr_t1c_edema`, `ucsf_bmsr_flair_edema` | dice |
+| adni | `adni_diagnosis`, `adni_mci_conversion`, `adni_wmh_flair`, `adni_wmh_t1`, `adni_hippocampus`, `adni_amygdala`, `adni_temporal_horns`, `adni_lateral_ventricles` | AUROC, R² |
 
 **ucsf_bmsr**: [UCSF-BMSR](https://imagingdatasets.ucsf.edu/dataset/1) v1.3 ([Rudie et al. 2024](https://doi.org/10.1148/ryai.230126)), brain metastasis segmentation. 199 visits, one per patient, with T1post, FLAIR and the BraTS-METS 2023 labels. Each task segments one label: enhancing tumor on T1c, and edema on T1c and on FLAIR.
 
 ```bash
 uv run python datasets/ucsf_bmsr/make_manifest.py /data/smri-datasets/UCSF-BMSR   # freeze the subjects
 uv run python datasets/ucsf_bmsr/make_dataset.py /data/smri-datasets/UCSF-BMSR $DURA_DATA_ROOT/ucsf_bmsr
+```
+
+**adni**: [ADNI](https://adni.loni.usc.edu) 3T scans from ADNIGO to ADNI4, converted from the DICOMs with dcm2niix, with labels from the ADNIMERGE2 tables of the 18 Jun 2026 download. ADNI1 is left out: it is mostly 1.5T and has no FLAIR. Each task has its own 500 subjects with one scan each (the four regional volume tasks share theirs), 1,458 subjects in all. ADNI's diagnosis comes from the same cognitive tests a clinician already has, so it is only a sanity check. The other tasks are things MRI itself shows: prognosis, small vessel disease and atrophy of the regions that separate Alzheimer's disease from normal aging.
+
+| Task | Input | Target | Subjects | Metric |
+|---|---|---|---|---|
+| `adni_diagnosis` | T1 | CN, MCI or dementia | 167, 166, 167 | macro one-vs-rest AUROC |
+| `adni_mci_conversion` | T1 of an MCI subject | dementia within 3 years | 500, 119 convert | AUROC |
+| `adni_wmh_flair` | 3D FLAIR | log white matter hyperintensity volume as a % of cranial volume (UC Davis) | 500 | R² |
+| `adni_wmh_t1` | T1 of the same session | the same | 500 | R² |
+| `adni_hippocampus` | T1 | hippocampal volume relative to normal aging (FreeSurfer 7) | 167, 166, 167 | R² |
+| `adni_amygdala` | T1 | the same for the amygdala | the same | R² |
+| `adni_temporal_horns` | T1 | the same for the temporal horns (inferior lateral ventricles) | the same | R² |
+| `adni_lateral_ventricles` | T1 | the same for the lateral ventricles | the same | R² |
+
+- Each task takes each subject's first eligible scan and samples 500 subjects with a fixed seed: diagnosis with balanced classes, MCI conversion keeping every converter.
+- The regional targets are W-scores: each log volume's residual from a linear fit on age, sex and log intracranial volume in amyloid negative CN subjects, in SDs. They measure atrophy beyond normal aging: the lateral ventricles grow with age in everyone, the hippocampus, amygdala and temporal horns change much faster in Alzheimer's disease. The subjects are balanced across CN, MCI and dementia. Most FreeSurfer runs were never rated visually, so runs whose volumes disagree with SynthSeg's are left out.
+- WMH uses 3D FLAIR only. ADNIGO/2 FLAIR is 2D with 5mm slices, on which UC Davis measures about twice as much WMH at the same age.
+- Each session uses one T1: distortion corrected before the uncorrected copy, first scan before repeat, full before accelerated.
+
+Classical features probed the same way give each task's reference scores ([baselines.py](datasets/adni/baselines.py)):
+
+| Task | age+sex | SynthSeg volumes | Task specific |
+|---|---|---|---|
+| `adni_diagnosis` | 0.58 | 0.77 | |
+| `adni_mci_conversion` | 0.56 | 0.71 | |
+| `adni_wmh_flair`, `adni_wmh_t1` | 0.19 | 0.22 | FreeSurfer T1 WM hypointensities 0.71 |
+| `adni_hippocampus` | 0.01 | 0.68 | |
+| `adni_amygdala` | 0.02 | 0.60 | |
+| `adni_temporal_horns` | 0.00 | 0.64 | |
+| `adni_lateral_ventricles` | -0.01 | 0.54 | |
+
+```bash
+uv run --group datasets python datasets/adni/make_manifest.py /data/smri-datasets/ADNI   # freeze the subjects
+uv run --group datasets python datasets/adni/make_dataset.py /data/smri-datasets/ADNI $DURA_DATA_ROOT/adni
+uv run --group datasets python datasets/adni/baselines.py /data/smri-datasets/ADNI   # reference scores
 ```
 
 ## Adding a model
