@@ -27,6 +27,8 @@ nanobrain = [
 
 [dependency-groups]
 dev = ["pytest"]
+# curation scripts in datasets/
+datasets = ["pandas", "pyreadr"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }

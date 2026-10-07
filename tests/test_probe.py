@@ -10,6 +10,7 @@ from dura.probe import (
     patchify3d,
     probe_binary_classification,
     probe_binary_segmentation,
+    probe_multiclass_classification,
     probe_regression,
     to_native,
 )
@@ -57,6 +58,7 @@ def samples(tmp_path_factory) -> list[dict]:
                 "class": labels[ii],
                 "random_class": random_labels[ii],
                 "age": ages[ii],
+                "age_group": int(np.digitize(ages[ii], [40, 60])),
             }
         )
     return samples
@@ -125,6 +127,15 @@ def test_probe_regression(samples):
     )
     assert record["r"] > 0.9
     assert record["mae"] < 10
+
+
+def test_probe_multiclass_classification(samples):
+    record, _ = probe_multiclass_classification(
+        DummyEncoder().cuda(), DummyTransform(), with_target(samples, "age_group")
+    )
+    assert record["auroc"] > 0.9
+    assert len(record["class_auroc"]) == 3
+    assert np.array(record["probabilities"]).shape == (40, 3)
 
 
 def test_probe_binary_segmentation(samples):

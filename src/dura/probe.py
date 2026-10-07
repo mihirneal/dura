@@ -10,7 +10,7 @@ from einops import rearrange
 from sklearn.linear_model import LogisticRegressionCV, RidgeCV
 from sklearn.metrics import balanced_accuracy_score, mean_absolute_error, r2_score, roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold
-from sklearn.pipeline import make_pipeline
+from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.preprocessing import StandardScaler
 from torch import Tensor
 from torch.utils.data import DataLoader
@@ -40,78 +40,35 @@ def probe_binary_classification(
     Linear probe for binary classification on the global embedding. Logistic regression with
     the penalty tuned by inner CV. Scores pooled out-of-fold predictions with bootstrap CIs.
     """
-    device_type = torch.device(device).type
-    model.eval()
-    fit_transform(transform, samples)
-    dataset = NiftiDataset(samples, transform)
-    loader = DataLoader(dataset, batch_size, num_workers=num_workers, collate_fn=collate)
-    embeddings = []
-    labels = []
-    embed_seconds = 0.0
-    with torch.inference_mode(), torch.autocast(device_type, dtype=torch.bfloat16, enabled=amp):
-        for batch in loader:
-            images = batch["image"].to(device)
-            masks = batch["mask"].to(device)
-            start = time.perf_counter()
-            embedding = model.global_embed(images, masks).float().cpu()
-            embed_seconds += time.perf_counter() - start
-            assert embedding.ndim == 2 and len(embedding) == len(images), (
-                f"unexpected global embedding shape {embedding.shape}"
-            )
-            embeddings.append(embedding)
-            labels.append(batch["target"])
-    features = torch.cat(embeddings).numpy()
-    labels = torch.cat(labels).numpy()
-    assert set(np.unique(labels)) == {0, 1}, "expected binary labels"
+    return probe_global(
+        fit_score_binary, model, transform, samples, n_folds, batch_size, num_workers, device, amp
+    )
 
-    n_samples = len(labels)
-    probabilities = np.zeros(n_samples)
-    fold_Cs = []
-    folds = StratifiedKFold(n_folds, shuffle=True, random_state=CV_SEED)
-    for train_ids, test_ids in folds.split(features, labels):
-        classifier = make_pipeline(
-            StandardScaler(),
-            LogisticRegressionCV(
-                Cs=LOGISTIC_CS,
-                l1_ratios=(0.0,),
-                scoring="neg_log_loss",
-                # so that 0.5 is a sensible cutoff for balanced accuracy
-                class_weight="balanced",
-                max_iter=1000,
-                use_legacy_attributes=False,
-            ),
-        )
-        classifier.fit(features[train_ids], labels[train_ids])
-        probabilities[test_ids] = classifier.predict_proba(features[test_ids])[:, 1]
-        fold_Cs.append(float(classifier[-1].C_))
-    predictions = probabilities > 0.5
 
-    rng = np.random.default_rng(0)
-    bootstrap_auroc = []
-    bootstrap_balanced_accuracy = []
-    for _ in range(N_BOOTSTRAP):
-        ids = rng.integers(0, n_samples, n_samples)
-        # auroc is undefined when a resample has only one class
-        if len(np.unique(labels[ids])) < 2:
-            continue
-        bootstrap_auroc.append(roc_auc_score(labels[ids], probabilities[ids]))
-        bootstrap_balanced_accuracy.append(balanced_accuracy_score(labels[ids], predictions[ids]))
-
-    result = {
-        "auroc": roc_auc_score(labels, probabilities),
-        "auroc_ci": np.percentile(bootstrap_auroc, [2.5, 97.5]).tolist(),
-        "balanced_accuracy": balanced_accuracy_score(labels, predictions),
-        "balanced_accuracy_ci": np.percentile(bootstrap_balanced_accuracy, [2.5, 97.5]).tolist(),
-        "fold_C": fold_Cs,
-        "labels": labels.tolist(),
-        "probabilities": probabilities.tolist(),
-        "n_samples": n_samples,
-        "embed_dim": features.shape[1],
-        "n_params": sum(p.numel() for p in model.parameters()),
-        "embed_seconds": embed_seconds,
-    }
-    state = {"features": features}
-    return result, state
+def probe_multiclass_classification(
+    model: ModelWrapper,
+    transform: ModelTransform,
+    samples: list[dict[str, Any]],
+    n_folds: int = 5,
+    batch_size: int = 8,
+    num_workers: int = 8,
+    device: str = "cuda",
+    amp: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """
+    Linear probe for labels 0..K-1 on the global embedding, scored by macro one-vs-rest AUROC.
+    """
+    return probe_global(
+        fit_score_multiclass,
+        model,
+        transform,
+        samples,
+        n_folds,
+        batch_size,
+        num_workers,
+        device,
+        amp,
+    )
 
 
 def probe_regression(
@@ -128,6 +85,51 @@ def probe_regression(
     Linear probe for regression on the global embedding. Ridge regression with the penalty
     tuned by leave-one-out. Scores pooled out-of-fold predictions with bootstrap CIs.
     """
+    return probe_global(
+        fit_score_regression,
+        model,
+        transform,
+        samples,
+        n_folds,
+        batch_size,
+        num_workers,
+        device,
+        amp,
+    )
+
+
+def probe_global(
+    fit_score: Callable[[np.ndarray, np.ndarray, int], dict[str, Any]],
+    model: ModelWrapper,
+    transform: ModelTransform,
+    samples: list[dict[str, Any]],
+    n_folds: int,
+    batch_size: int,
+    num_workers: int,
+    device: str,
+    amp: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Global embeddings scored with fit_score."""
+    features, targets, embed_seconds = embed_global(
+        model, transform, samples, batch_size, num_workers, device, amp
+    )
+    result = fit_score(features, targets, n_folds)
+    result["n_params"] = sum(p.numel() for p in model.parameters())
+    result["embed_seconds"] = embed_seconds
+    state = {"features": features}
+    return result, state
+
+
+def embed_global(
+    model: ModelWrapper,
+    transform: ModelTransform,
+    samples: list[dict[str, Any]],
+    batch_size: int,
+    num_workers: int,
+    device: str,
+    amp: bool,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Global embeddings [N D], targets [N] and seconds spent embedding."""
     device_type = torch.device(device).type
     model.eval()
     fit_transform(transform, samples)
@@ -148,9 +150,96 @@ def probe_regression(
             )
             embeddings.append(embedding)
             targets.append(batch["target"])
-    features = torch.cat(embeddings).numpy()
-    targets = torch.cat(targets).double().numpy()
+    return torch.cat(embeddings).numpy(), torch.cat(targets).numpy(), embed_seconds
 
+
+def fit_score_binary(features: np.ndarray, labels: np.ndarray, n_folds: int = 5) -> dict[str, Any]:
+    """Logistic regression in n_folds CV, pooled out-of-fold scores with bootstrap CIs."""
+    assert set(np.unique(labels)) == {0, 1}, "expected binary labels"
+    n_samples = len(labels)
+    probabilities = np.zeros(n_samples)
+    fold_Cs = []
+    folds = StratifiedKFold(n_folds, shuffle=True, random_state=CV_SEED)
+    for train_ids, test_ids in folds.split(features, labels):
+        classifier = logistic_classifier()
+        classifier.fit(features[train_ids], labels[train_ids])
+        probabilities[test_ids] = classifier.predict_proba(features[test_ids])[:, 1]
+        fold_Cs.append(float(classifier[-1].C_))
+    predictions = probabilities > 0.5
+
+    rng = np.random.default_rng(0)
+    bootstrap_auroc = []
+    bootstrap_balanced_accuracy = []
+    for _ in range(N_BOOTSTRAP):
+        ids = rng.integers(0, n_samples, n_samples)
+        # auroc is undefined when a resample has only one class
+        if len(np.unique(labels[ids])) < 2:
+            continue
+        bootstrap_auroc.append(roc_auc_score(labels[ids], probabilities[ids]))
+        bootstrap_balanced_accuracy.append(balanced_accuracy_score(labels[ids], predictions[ids]))
+
+    return {
+        "auroc": roc_auc_score(labels, probabilities),
+        "auroc_ci": np.percentile(bootstrap_auroc, [2.5, 97.5]).tolist(),
+        "balanced_accuracy": balanced_accuracy_score(labels, predictions),
+        "balanced_accuracy_ci": np.percentile(bootstrap_balanced_accuracy, [2.5, 97.5]).tolist(),
+        "fold_C": fold_Cs,
+        "labels": labels.tolist(),
+        "probabilities": probabilities.tolist(),
+        "n_samples": n_samples,
+        "embed_dim": features.shape[1],
+    }
+
+
+def fit_score_multiclass(
+    features: np.ndarray, labels: np.ndarray, n_folds: int = 5
+) -> dict[str, Any]:
+    """Multinomial logistic regression, scored like fit_score_binary."""
+    n_classes = len(np.unique(labels))
+    assert n_classes > 2 and set(np.unique(labels)) == set(range(n_classes)), (
+        "expected labels 0..K-1 with K > 2, use probe_binary_classification for two classes"
+    )
+    n_samples = len(labels)
+    probabilities = np.zeros((n_samples, n_classes))
+    fold_Cs = []
+    folds = StratifiedKFold(n_folds, shuffle=True, random_state=CV_SEED)
+    for train_ids, test_ids in folds.split(features, labels):
+        classifier = logistic_classifier()
+        classifier.fit(features[train_ids], labels[train_ids])
+        probabilities[test_ids] = classifier.predict_proba(features[test_ids])
+        fold_Cs.append(float(classifier[-1].C_))
+    predictions = probabilities.argmax(axis=1)
+
+    rng = np.random.default_rng(0)
+    bootstrap_auroc = []
+    bootstrap_balanced_accuracy = []
+    for _ in range(N_BOOTSTRAP):
+        ids = rng.integers(0, n_samples, n_samples)
+        # one-vs-rest auroc is undefined when a resample misses a class
+        if len(np.unique(labels[ids])) < n_classes:
+            continue
+        bootstrap_auroc.append(roc_auc_score(labels[ids], probabilities[ids], multi_class="ovr"))
+        bootstrap_balanced_accuracy.append(balanced_accuracy_score(labels[ids], predictions[ids]))
+
+    return {
+        "auroc": roc_auc_score(labels, probabilities, multi_class="ovr"),
+        "auroc_ci": np.percentile(bootstrap_auroc, [2.5, 97.5]).tolist(),
+        "class_auroc": [roc_auc_score(labels == k, probabilities[:, k]) for k in range(n_classes)],
+        "balanced_accuracy": balanced_accuracy_score(labels, predictions),
+        "balanced_accuracy_ci": np.percentile(bootstrap_balanced_accuracy, [2.5, 97.5]).tolist(),
+        "fold_C": fold_Cs,
+        "labels": labels.tolist(),
+        "probabilities": probabilities.tolist(),
+        "n_samples": n_samples,
+        "embed_dim": features.shape[1],
+    }
+
+
+def fit_score_regression(
+    features: np.ndarray, targets: np.ndarray, n_folds: int = 5
+) -> dict[str, Any]:
+    """Ridge in n_folds CV, pooled out-of-fold scores with bootstrap CIs."""
+    targets = np.asarray(targets, dtype=np.float64)
     n_samples = len(targets)
     predictions = np.zeros(n_samples)
     fold_alphas = []
@@ -171,7 +260,7 @@ def probe_regression(
         bootstrap_r.append(np.corrcoef(targets[ids], predictions[ids])[0, 1])
         bootstrap_r2.append(r2_score(targets[ids], predictions[ids]))
 
-    result = {
+    return {
         "mae": mean_absolute_error(targets, predictions),
         "mae_ci": np.percentile(bootstrap_mae, [2.5, 97.5]).tolist(),
         "r": np.corrcoef(targets, predictions)[0, 1],
@@ -183,11 +272,22 @@ def probe_regression(
         "predictions": predictions.tolist(),
         "n_samples": n_samples,
         "embed_dim": features.shape[1],
-        "n_params": sum(p.numel() for p in model.parameters()),
-        "embed_seconds": embed_seconds,
     }
-    state = {"features": features}
-    return result, state
+
+
+def logistic_classifier() -> Pipeline:
+    return make_pipeline(
+        StandardScaler(),
+        LogisticRegressionCV(
+            Cs=LOGISTIC_CS,
+            l1_ratios=(0.0,),
+            scoring="neg_log_loss",
+            # so 0.5 / argmax is a sensible cutoff
+            class_weight="balanced",
+            max_iter=1000,
+            use_legacy_attributes=False,
+        ),
+    )
 
 
 def probe_binary_segmentation(
