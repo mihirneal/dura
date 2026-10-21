@@ -24,6 +24,8 @@ LOGISTIC_CS = np.logspace(-4, 4, 9)
 RIDGE_ALPHAS = np.logspace(-2, 6, 9)
 SEGMENTATION_ALPHAS = (1e1, 1e2, 1e3, 1e4, 1e5)
 SEGMENTATION_THRESHOLDS = torch.logspace(-3, -0.1, 30)
+# rows per chunk of the logistic loss, so large training sets fit in memory
+LOGISTIC_CHUNK = 2**18
 
 
 def probe_binary_classification(
@@ -477,13 +479,14 @@ def fit_predict_segmentation(
 ) -> list[Tensor]:
     """Fit on the train subjects' patches, return per-patch probabilities for each test subject."""
     train_features = torch.cat([patch_features[ii] for ii in train_ids])
-    train_labels = torch.cat([patch_labels[ii] for ii in train_ids]).float()
+    train_labels = torch.cat([patch_labels[ii] for ii in train_ids])
     if max_negative_ratio is not None:
         keep_ids = subsample_negatives(train_labels, max_negative_ratio)
         train_features, train_labels = train_features[keep_ids], train_labels[keep_ids]
     mean = train_features.mean(dim=0)
     std = train_features.std(dim=0, correction=0).clamp_min(1e-6)
-    coef, intercept = fit_logistic((train_features - mean) / std, train_labels, alpha)
+    # in place: train_features is a copy
+    coef, intercept = fit_logistic(train_features.sub_(mean).div_(std), train_labels, alpha)
 
     probabilities = []
     for ii in test_ids:
@@ -594,7 +597,8 @@ def fit_logistic(
 ) -> tuple[Tensor, Tensor]:
     """
     L2 penalized logistic regression fit with L-BFGS. Each target column is a separate binary
-    problem sharing the same features. Targets can be soft (between 0 and 1).
+    problem sharing the same features. Targets can be soft (between 0 and 1) or integer labels.
+    The loss is summed over chunks of LOGISTIC_CHUNK rows.
     """
     n, d = features.shape
     assert targets.ndim == 2 and len(targets) == n, (
@@ -603,7 +607,8 @@ def fit_logistic(
     n_outputs = targets.shape[1]
 
     coef = torch.zeros(d, n_outputs, device=features.device, dtype=features.dtype)
-    intercept = torch.logit(targets.mean(dim=0).clamp(1e-6, 1 - 1e-6))
+    target_mean = targets.sum(dim=0, dtype=torch.float64).div(n).to(features.dtype)
+    intercept = torch.logit(target_mean.clamp(1e-6, 1 - 1e-6))
     coef.requires_grad_(True)
     intercept.requires_grad_(True)
 
@@ -613,10 +618,17 @@ def fit_logistic(
 
     def closure() -> Tensor:
         optimizer.zero_grad()
-        logits = features @ coef + intercept
-        loss = F.binary_cross_entropy_with_logits(logits, targets)
-        loss = loss + alpha * coef.square().sum() / (n * n_outputs)
+        loss = alpha * coef.square().sum() / (n * n_outputs)
         loss.backward()
+        loss = loss.detach()
+        for start in range(0, n, LOGISTIC_CHUNK):
+            rows = slice(start, start + LOGISTIC_CHUNK)
+            logits = features[rows] @ coef + intercept
+            chunk_loss = F.binary_cross_entropy_with_logits(
+                logits, targets[rows].to(features.dtype), reduction="sum"
+            ) / (n * n_outputs)
+            chunk_loss.backward()
+            loss = loss + chunk_loss.detach()
         return loss
 
     optimizer.step(closure)
