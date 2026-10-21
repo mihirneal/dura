@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from adni import REGIONS, demographics, nearest, read_table, session, synthseg_volumes
+from adni import demographics, nearest, read_table, session, synthseg_volumes
 
 from dura.data import DATA_ROOT
 from dura.probe import fit_score_binary, fit_score_multiclass, fit_score_regression
@@ -21,7 +21,6 @@ FIT_SCORE = {
     "adni_mci_conversion": fit_score_binary,
     "adni_wmh_flair": fit_score_regression,
     "adni_wmh_t1": fit_score_regression,
-    **{f"adni_{region}": fit_score_regression for region in REGIONS},
 }
 
 

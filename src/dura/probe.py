@@ -308,7 +308,8 @@ def probe_binary_segmentation(
     the voxel labels inside its patch, on the model's input grid. The penalty and threshold are
     tuned by inner CV on that grid. The out-of-fold predictions are then mapped back to each
     label's native grid, where per-subject dice, average precision and voxel auroc are scored
-    with bootstrap CIs, so models with different grids are scored on the same voxels.
+    with bootstrap CIs, so models with different grids are scored on the same voxels. Also
+    scores the predicted volumes against the label volumes across subjects (r2, r).
     """
     device_type = torch.device(device).type
     model.eval()
@@ -364,6 +365,8 @@ def probe_binary_segmentation(
     subject_model_grid_dice = np.zeros(n_subjects)
     subject_average_precision = np.zeros(n_subjects)
     subject_voxel_auroc = np.zeros(n_subjects)
+    subject_volume = np.zeros(n_subjects)
+    subject_label_volume = np.zeros(n_subjects)
     subject_probabilities_out_of_fold = [None] * n_subjects
     subject_fold = np.zeros(n_subjects, dtype=int)
     fold_alphas = []
@@ -415,16 +418,22 @@ def probe_binary_segmentation(
             ).item()
             subject_average_precision[ii] = average_precision(native_probabilities, native_labels)
             subject_voxel_auroc[ii] = voxel_auroc(native_probabilities, native_labels)
+            voxel_ml = abs(np.linalg.det(geometry[ii]["label_affine"][:3, :3])) / 1000
+            n_predicted = (native_probabilities >= threshold.to(native_probabilities.device)).sum()
+            subject_volume[ii] = n_predicted.item() * voxel_ml
+            subject_label_volume[ii] = native_labels.sum().item() * voxel_ml
 
     rng = np.random.default_rng(0)
     bootstrap_dice = []
     bootstrap_average_precision = []
     bootstrap_voxel_auroc = []
+    bootstrap_volume_r2 = []
     for _ in range(N_BOOTSTRAP):
         ids = rng.integers(0, n_subjects, n_subjects)
         bootstrap_dice.append(subject_dice[ids].mean())
         bootstrap_average_precision.append(np.nanmean(subject_average_precision[ids]))
         bootstrap_voxel_auroc.append(np.nanmean(subject_voxel_auroc[ids]))
+        bootstrap_volume_r2.append(r2_score(subject_label_volume[ids], subject_volume[ids]))
 
     result = {
         "dice": subject_dice.mean(),
@@ -434,11 +443,16 @@ def probe_binary_segmentation(
         "voxel_auroc": np.nanmean(subject_voxel_auroc),
         "voxel_auroc_ci": np.nanpercentile(bootstrap_voxel_auroc, [2.5, 97.5]).tolist(),
         "model_grid_dice": subject_model_grid_dice.mean(),
+        "volume_r2": r2_score(subject_label_volume, subject_volume),
+        "volume_r2_ci": np.percentile(bootstrap_volume_r2, [2.5, 97.5]).tolist(),
+        "volume_r": np.corrcoef(subject_label_volume, subject_volume)[0, 1],
         "fold_alpha": fold_alphas,
         "fold_threshold": fold_thresholds,
         "subject_dice": subject_dice.tolist(),
         "subject_average_precision": subject_average_precision.tolist(),
         "subject_voxel_auroc": subject_voxel_auroc.tolist(),
+        "subject_volume_ml": subject_volume.tolist(),
+        "subject_label_volume_ml": subject_label_volume.tolist(),
         "n_samples": n_subjects,
         "embed_dim": embed_dim,
         "n_params": sum(p.numel() for p in model.parameters()),

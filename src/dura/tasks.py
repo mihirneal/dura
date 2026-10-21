@@ -17,6 +17,12 @@ Probe = Callable[..., tuple[dict[str, Any], dict[str, Any]]]
 
 UCSF_EDEMA = 2
 UCSF_ENHANCING = 3
+# SynthSeg labels, left and right
+SYNTHSEG_HIPPOCAMPUS = (17, 53)
+SYNTHSEG_AMYGDALA = (18, 54)
+SYNTHSEG_INFERIOR_LATERAL_VENTRICLES = (5, 44)
+SYNTHSEG_LATERAL_VENTRICLES = (4, 43)
+SYNTHSEG_CORTEX = (3, 42)
 MAX_NEGATIVE_RATIO = 10.0
 
 
@@ -62,8 +68,8 @@ def ucsf_bmsr_flair_edema() -> Probe:
 
 
 def adni_samples(task: str, target_type: type = float) -> list[dict[str, Any]]:
-    """One subject per row of DATA_ROOT/adni/<task>.tsv: its image, relative to DATA_ROOT/adni,
-    and the target."""
+    """One subject per row of DATA_ROOT/adni/<task>.tsv: its image and label, relative to
+    DATA_ROOT/adni, or its target."""
     root = DATA_ROOT / "adni"
     with (root / f"{task}.tsv").open() as f:
         rows = list(csv.DictReader(f, delimiter="\t"))
@@ -72,7 +78,11 @@ def adni_samples(task: str, target_type: type = float) -> list[dict[str, Any]]:
         {
             "subject": row["subject"],
             "image": root / row["image"],
-            "target": target_type(row["target"]),
+            **(
+                {"label": root / row["label"]}
+                if "label" in row
+                else {"target": target_type(row["target"])}
+            ),
         }
         for row in rows
     ]
@@ -94,20 +104,33 @@ def adni_wmh_t1() -> Probe:
     return partial(probe_regression, samples=adni_samples("adni_wmh_t1"))
 
 
+def adni_anatomy_label(label_ids: tuple[int, ...]) -> Probe:
+    return partial(
+        probe_binary_segmentation,
+        samples=adni_samples("adni_anatomy"),
+        label_fn=partial(select_labels, label_ids=label_ids),
+        max_negative_ratio=MAX_NEGATIVE_RATIO,
+    )
+
+
 def adni_hippocampus() -> Probe:
-    return partial(probe_regression, samples=adni_samples("adni_hippocampus"))
+    return adni_anatomy_label(SYNTHSEG_HIPPOCAMPUS)
 
 
 def adni_amygdala() -> Probe:
-    return partial(probe_regression, samples=adni_samples("adni_amygdala"))
+    return adni_anatomy_label(SYNTHSEG_AMYGDALA)
 
 
 def adni_temporal_horns() -> Probe:
-    return partial(probe_regression, samples=adni_samples("adni_temporal_horns"))
+    return adni_anatomy_label(SYNTHSEG_INFERIOR_LATERAL_VENTRICLES)
 
 
 def adni_lateral_ventricles() -> Probe:
-    return partial(probe_regression, samples=adni_samples("adni_lateral_ventricles"))
+    return adni_anatomy_label(SYNTHSEG_LATERAL_VENTRICLES)
+
+
+def adni_cortex() -> Probe:
+    return adni_anatomy_label(SYNTHSEG_CORTEX)
 
 
 TASKS: dict[str, Callable[[], Probe]] = {
@@ -124,6 +147,7 @@ TASKS: dict[str, Callable[[], Probe]] = {
         adni_amygdala,
         adni_temporal_horns,
         adni_lateral_ventricles,
+        adni_cortex,
     ]
 }
 
@@ -136,8 +160,9 @@ HEADLINE_METRICS: dict[str, str] = {
     "adni_mci_conversion": "auroc",
     "adni_wmh_flair": "r2",
     "adni_wmh_t1": "r2",
-    "adni_hippocampus": "r2",
-    "adni_amygdala": "r2",
-    "adni_temporal_horns": "r2",
-    "adni_lateral_ventricles": "r2",
+    "adni_hippocampus": "dice",
+    "adni_amygdala": "dice",
+    "adni_temporal_horns": "dice",
+    "adni_lateral_ventricles": "dice",
+    "adni_cortex": "dice",
 }
