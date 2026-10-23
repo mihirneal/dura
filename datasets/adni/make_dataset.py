@@ -1,4 +1,5 @@
-"""Symlink the manifest's images and write each task's <task>.tsv with targets.
+"""Symlink the manifest's images and write each task's <task>.tsv with targets, or with label
+paths for adni_anatomy (made by make_labels.py).
 
     uv run --group datasets python datasets/adni/make_dataset.py /data/smri-datasets/ADNI \
         /data/mihir-stuff/dura/adni
@@ -32,6 +33,12 @@ def link_path(name: str) -> str:
     return f"images/{sub}/{ses}/{name}"
 
 
+def label_path(name: str) -> str:
+    """Where make_labels.py writes the SynthSeg labels of an image."""
+    sub, ses = name.split("_")[:2]
+    return f"labels/{sub}/{ses}/{name.replace('.nii.gz', '_synthseg.nii.gz')}"
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("raw_root", type=Path, help="ADNI release, with nifti/ and metadata/")
@@ -59,6 +66,8 @@ if __name__ == "__main__":
         link.parent.mkdir(parents=True, exist_ok=True)
         link.symlink_to(image_path(args.raw_root, name))
     for task, table in tables.items():
+        if task == "adni_anatomy":
+            table = table.drop(columns="target").assign(label=table.image.map(label_path))
         table = table.assign(image=table.image.map(link_path))
         table.to_csv(args.out_root / f"{task}.tsv", sep="\t", index=False)
     print(f"{len(names)} images, {manifest.subject.nunique()} subjects -> {args.out_root}")

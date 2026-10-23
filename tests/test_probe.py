@@ -151,6 +151,11 @@ def test_probe_binary_segmentation(samples):
     assert record["dice"] > 0.85
     assert record["average_precision"] > 0.9
     assert record["voxel_auroc"] > 0.9
+    # 8mm radius blobs, 2.1 ml
+    assert np.allclose(record["subject_label_volume_ml"], 4 / 3 * np.pi * 0.8**3, rtol=0.05)
+    # no bias overall, though one threshold over- and under-segments blobs of either contrast
+    volume_ratio = np.mean(record["subject_volume_ml"]) / np.mean(record["subject_label_volume_ml"])
+    assert abs(volume_ratio - 1) < 0.1
     assert record["embed_dim"] == 512
     assert len(record["subject_dice"]) == 20
     assert state["geometry"][0]["label_shape"] == NATIVE_SHAPE
