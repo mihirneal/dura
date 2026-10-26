@@ -3,7 +3,6 @@ One scan per subject, at most MAX_SUBJECTS per task."""
 
 import json
 import re
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -22,7 +21,6 @@ DX_MAX_DAYS = 90
 CONVERSION_YEARS = 3.0
 CONVERSION_MIN_FOLLOWUP_YEARS = CONVERSION_YEARS - 0.25
 WMH_LOG_OFFSET = 0.01
-MIN_SYNTHSEG_QC = 0.65
 
 # noise, no brain
 BAD_IMAGES = {"sub-019S4835_ses-20170719_run-02_FLAIR.nii.gz"}
@@ -152,42 +150,6 @@ def wmh(raw_root: Path, images: pd.DataFrame, t1: pd.DataFrame) -> pd.DataFrame:
     wmh_percent = 100 * flair.TOTAL_WMH / flair.CEREBRUM_TCV
     flair = flair.assign(flair=flair["name"], target=np.log(wmh_percent + WMH_LOG_OFFSET))
     return flair[["subject", "date", "flair", "target"]]
-
-
-def demographics(raw_root: Path) -> pd.DataFrame:
-    demo = read_table(raw_root, "PTDEMOG")
-    demo = demo.assign(dob=pd.to_datetime(demo.PTDOB, format="%m/%Y", errors="coerce"))
-    demo = demo.dropna(subset=["dob"]).sort_values("VISDATE").drop_duplicates("RID")
-    return demo.assign(male=(demo.PTGENDER.astype(str) == "Male").astype(float))[
-        ["RID", "dob", "male"]
-    ]
-
-
-def session(name: str) -> tuple[str, pd.Timestamp]:
-    """(subject, date) of a sub-<subject>_ses-<date>_... name."""
-    match = re.search(r"sub-(\w+?)_ses-(\d{8})_", name)
-    return match[1], pd.Timestamp(match[2])
-
-
-def synthseg_volumes(raw_root: Path, sessions: set[tuple[str, pd.Timestamp]]) -> pd.DataFrame:
-    """Volumes of each session's best SynthSeg run, matched by session, not run number."""
-    qc_files = defaultdict(list)
-    for path in (raw_root / "synthseg").glob("sub-*_T1w*_qc.csv"):
-        key = session(path.name)
-        if key in sessions:
-            qc_files[key].append(path)
-
-    def best_run(paths: list[Path]) -> pd.Series | None:
-        qc = {path: pd.read_csv(path, index_col=0).iloc[0].min() for path in paths}
-        best = max(qc, key=qc.get)
-        if qc[best] < MIN_SYNTHSEG_QC:
-            return None
-        return pd.read_csv(str(best).replace("_qc.csv", "_volumes.csv"), index_col=0).iloc[0]
-
-    with ThreadPoolExecutor(32) as executor:
-        volumes = dict(zip(qc_files, executor.map(best_run, qc_files.values())))
-    volumes = {key: row for key, row in volumes.items() if row is not None}
-    return pd.DataFrame.from_dict(volumes, orient="index")
 
 
 def first_session(table: pd.DataFrame) -> pd.DataFrame:

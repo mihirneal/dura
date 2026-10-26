@@ -14,6 +14,7 @@ References:
 
 import importlib
 import math
+from pathlib import Path
 
 import nibabel as nib
 import numpy as np
@@ -23,6 +24,7 @@ from jaxtyping import Float
 from nibabel.processing import resample_from_to, resample_to_output, smooth_image
 from torch import Tensor, nn
 
+from dura.data import DATA_ROOT
 from dura.models.base import ModelTransform, ModelWrapper
 from dura.models.registry import register_model
 
@@ -34,23 +36,27 @@ except ImportError as exc:
     ) from exc
 
 GRID_FOV = (192.0, 240.0, 192.0)
+MASKS_ROOT = DATA_ROOT / "brain_masks"
 VMIN_QUANTILE = 0.005
 VMAX_QUANTILE = 0.995
-DEFAULT_MODEL_CLASS = "nanobrain.model:ViTMAE3D"
 
 
 class NanobrainTransform(ModelTransform):
     """
-    Output: image [192 240 192], raw values in [0, 2**16) zero outside the head mask, and the
-    head mask on the same grid.
+    Output: image [192 240 192], raw values in [0, 2**16) zero outside the mask, and the mask on
+    the same grid. As in pretraining, the grid is placed on the threshold head mask, then the
+    image is masked with the brain mask.
     """
 
     def __init__(self, grid_fov: tuple[float, float, float] = GRID_FOV):
         self.grid_fov = grid_fov
 
     def __call__(self, img: nib.Nifti1Image) -> dict:
-        mask_img = threshold_mask(img)
-        fit_img = conform_image(img, mask_img, max_fov=self.grid_fov, fixed_grid=True)
+        head_img = threshold_mask(img)
+        fit_img = conform_image(img, head_img, max_fov=self.grid_fov)
+        brain_path = MASKS_ROOT / Path(img.get_filename()).relative_to(DATA_ROOT)
+        brain = (np.asarray(nib.load(brain_path).dataobj) > 0) & (np.asarray(head_img.dataobj) > 0)
+        mask_img = nib.Nifti1Image(brain.astype(np.uint8), img.affine)
         fit_mask = np.asarray(resample_from_to(mask_img, fit_img, order=0).dataobj) > 0
         image = truncate_image(fit_img.get_fdata(dtype=np.float32), fit_mask)
         return {
@@ -61,7 +67,8 @@ class NanobrainTransform(ModelTransform):
 
 
 class NanobrainModelWrapper(ModelWrapper):
-    """Input [B 192 240 192], dense output on the 8mm patch grid [B 24 30 24 D]."""
+    """Input [B 192 240 192]. Dense output on the model's own patch grid, e.g. [B 48 60 48 D] for
+    patch 4."""
 
     def __init__(self, backbone: nn.Module):
         super().__init__()
@@ -70,19 +77,13 @@ class NanobrainModelWrapper(ModelWrapper):
     def dense_embed(
         self, images: Float[Tensor, "B X Y Z"], mask: Float[Tensor, "B X Y Z"]
     ) -> Float[Tensor, "B Gx Gy Gz D"]:
-        return self.backbone.dense_embed(images, mask)
-
-    def global_embed(
-        self, images: Float[Tensor, "B X Y Z"], mask: Float[Tensor, "B X Y Z"]
-    ) -> Float[Tensor, "B D"]:
-        return self.backbone.global_embed(images, mask)
+        return self.backbone.dense_embed(images, mask, cell_size=self.backbone.patch_size)
 
 
 def build_backbone(ckpt_path: str, load_weights: bool = True) -> nn.Module:
-    """Build the checkpoint's model from its training config. Older checkpoints have no
-    model_class and are all ViTMAE3D."""
+    """Build the checkpoint's model from its training config."""
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    module_name, class_name = checkpoint.get("model_class", DEFAULT_MODEL_CLASS).split(":")
+    module_name, class_name = checkpoint["model_class"].split(":")
     model_class = getattr(importlib.import_module(module_name), class_name)
     model = model_class.from_config(checkpoint["args"])
     if load_weights:
@@ -185,18 +186,15 @@ def conform_image(
     img: nib.Nifti1Image,
     mask_img: nib.Nifti1Image,
     min_voxel_size: float = 1.0,
-    max_fov: tuple[float, float, float] = (208.0, 240.0, 208.0),
+    max_fov: tuple[float, float, float] = GRID_FOV,
     top_margin: float = 5.0,
     order: int = 1,
-    fixed_grid: bool = False,
 ):
-    """Conform image to target minimum voxel size and max FOV.
+    """Resample to min_voxel_size spacing on a grid spanning max_fov, zero padding where the
+    image does not reach.
 
     The x/y crop is centered on the head mask. The z crop is taken from the top of the
     head mask (plus top_margin mm) down.
-
-    With fixed_grid, resample to exactly min_voxel_size spacing on a grid spanning max_fov,
-    zero padding where the image does not reach.
 
     References:
         https://github.com/nipy/nibabel/blob/5.4.2/nibabel/processing.py#L318
@@ -209,16 +207,11 @@ def conform_image(
     mask_img = nib.as_closest_canonical(mask_img)
 
     voxel_sizes = img.header.get_zooms()
-    if fixed_grid:
-        new_voxel_sizes = 3 * [min_voxel_size]
-        new_fov = list(max_fov)
-    else:
-        new_voxel_sizes = [max(min_voxel_size, sz) for sz in voxel_sizes]
-        fov = [w * sz for w, sz in zip(img.shape, voxel_sizes)]
-        new_fov = [min(w_, w) for w_, w in zip(max_fov, fov)]
+    new_voxel_sizes = 3 * [min_voxel_size]
+    new_fov = list(max_fov)
     new_shape = [math.ceil(w / sz) for w, sz in zip(new_fov, new_voxel_sizes)]
 
-    # smooth before downsampling. upsampled axes (fixed grid only) get no smoothing
+    # smooth before downsampling. upsampled axes get no smoothing
     if any(sz_ > sz for sz_, sz in zip(new_voxel_sizes, voxel_sizes)):
         fwhm = [
             math.sqrt(max(sz_**2 - sz**2, 0.0)) for sz_, sz in zip(new_voxel_sizes, voxel_sizes)

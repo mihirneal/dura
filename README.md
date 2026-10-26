@@ -20,14 +20,20 @@ uv run python -m dura.run <model> <output_dir> --model-kwargs ckpt_path=/path/to
 
 Each task writes `<output_dir>/<task>.json`, and tasks that already have a result are skipped. `--tasks` runs a subset, and `--help` lists the registered models and tasks.
 
+The global tasks (classification and regression) use a light attention probe in 5-fold CV. It pools the model's last-layer patch tokens with one learned query (a softmax over the tokens, then a linear head), so it can weight the regions that matter, and its weights are a per-subject attention map. Its weight decay and epochs are picked by inner CV, and it is refit with three seeds. It needs a GPU, and keeps every subject's tokens on it (~20 GB for 500 subjects at patch 4). Segmentation uses a linear probe on each patch token.
+
 | Model | Extra | Kwargs |
 |---|---|---|
 | `nanobrain` | `nanobrain` | `ckpt_path` |
 | `nanobrain_random` | `nanobrain` | `ckpt_path` (for the architecture), `seed` (default 42) |
 
+nanobrain's transform matches its pretraining: it places each image on the grid by the threshold head mask, then keeps only the voxels inside a precomputed SynthSeg brain mask (see below) and zeroes the rest. The probes read the model's own patch grid, e.g. 4 mm for patch 4.
+
 ## Datasets
 
 The releases sit behind logins or data use agreements, so each one is downloaded by hand and nothing here downloads data. The data lives in `DURA_DATA_ROOT` (default `/data/mihir-stuff/dura`), a release's eval subjects in `<name>/`. The nii.gz are used exactly as released: dura does no preprocessing, each model's `transform` does its own on the fly.
+
+Brain masks live in `DURA_DATA_ROOT/brain_masks/<image path relative to DURA_DATA_ROOT>` (uint8 on the image grid, 1 = SynthSeg label > 0). They are made by nanobrain's `experiments/climb/dura_brain_masks.py`, which skips masks that already exist, so rerun it after adding images.
 
 | Dataset | Tasks | Metric |
 |---|---|---|
@@ -60,19 +66,10 @@ uv run python datasets/ucsf_bmsr/make_dataset.py /data/smri-datasets/UCSF-BMSR $
 - WMH uses 3D FLAIR only. ADNIGO/2 FLAIR is 2D with 5mm slices, on which UC Davis measures about twice as much WMH at the same age.
 - Each session uses one T1: distortion corrected before the uncorrected copy, first scan before repeat, full before accelerated.
 
-Classical features probed the same way give each task's reference scores ([baselines.py](datasets/adni/baselines.py)):
-
-| Task | age+sex | SynthSeg volumes | Task specific |
-|---|---|---|---|
-| `adni_diagnosis` | 0.58 | 0.77 | |
-| `adni_mci_conversion` | 0.56 | 0.71 | |
-| `adni_wmh_flair`, `adni_wmh_t1` | 0.19 | 0.22 | FreeSurfer T1 WM hypointensities 0.71 |
-
 ```bash
 uv run --group datasets python datasets/adni/make_manifest.py /data/smri-datasets/ADNI   # freeze the subjects
 uv run --group datasets python datasets/adni/make_dataset.py /data/smri-datasets/ADNI $DURA_DATA_ROOT/adni
 uv run --group datasets python datasets/adni/make_labels.py $DURA_DATA_ROOT/adni   # SynthSeg, GPU, or --cpu
-uv run --group datasets python datasets/adni/baselines.py /data/smri-datasets/ADNI   # reference scores
 ```
 
 ## Adding a model
@@ -93,8 +90,7 @@ uv run --group datasets python datasets/adni/baselines.py /data/smri-datasets/AD
     ```
 
     - `transform(img)`: the raw `nib.Nifti1Image` → `{"image": [X Y Z], "mask": [X Y Z], "affine": [4 4]}`. All of the model's preprocessing (reorienting, resampling, cropping, masking, normalization) happens here, on the fly in the data loader workers. The shape must be the same for every image, and the affine maps the grid to world space. An optional `fit(images)` precomputes global parameters on a task's raw images.
-    - `dense_embed(images, mask)`: `[B X Y Z]` → `[B Gx Gy Gz C]`, a patch grid that tiles `X Y Z` exactly
-    - `global_embed(images, mask)`: `[B X Y Z]` → `[B D]`
+    - `dense_embed(images, mask)`: `[B X Y Z]` → `[B Gx Gy Gz C]`, a patch grid that tiles `X Y Z` exactly. Every probe reads these tokens.
 
     Segmentation labels are resampled onto the model's grid to train the probe, and the predictions are mapped back to the labels' native grid for scoring, so every model is scored on the same voxels. [src/dura/models/nanobrain.py](src/dura/models/nanobrain.py) is a full example.
 

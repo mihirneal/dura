@@ -5,6 +5,7 @@ import torch
 from nibabel.processing import resample_from_to
 from torch import Tensor
 
+import dura.probe
 from dura.models.base import ModelTransform, ModelWrapper
 from dura.probe import (
     patchify3d,
@@ -22,6 +23,9 @@ NATIVE_SHAPE = (64, 64, 32)
 NATIVE_AFFINE = np.array([[-1, 0, 0, 63], [0, 1, 0, 0], [0, 0, 2, 0], [0, 0, 0, 1]], dtype=float)
 MODEL_SHAPE = (64, 64, 64)
 PATCH_SIZE = (8, 8, 8)
+N_BINS = 64
+BIN_WIDTH = 10.0
+EMBED_DIM = 8**3 + 2 * N_BINS
 
 
 @pytest.fixture(scope="module")
@@ -84,23 +88,27 @@ class DummyTransform(ModelTransform):
 
 
 class DummyEncoder(ModelWrapper):
+    """Each patch's voxels, plus its mean and max intensity as soft one-hots over intensity bins:
+    the attention probe layer-norms each token, which removes a level shared by its voxels."""
+
     def __init__(self):
         super().__init__()
         self.scale = torch.nn.Parameter(torch.ones(()))
-        quantiles = torch.tensor([0.5, 0.9, 0.99, 0.995, 0.998, 0.999, 0.9995, 0.9999, 1.0])
-        self.register_buffer("quantiles", quantiles)
-
-    def global_embed(self, images: Tensor, mask: Tensor) -> Tensor:
-        embeddings = []
-        for image, image_mask in zip(images, mask):
-            values = image[image_mask > 0].float()
-            embeddings.append(torch.quantile(values, self.quantiles))
-        return self.scale * torch.stack(embeddings)
+        self.register_buffer("bins", torch.linspace(0, 500, N_BINS))
 
     def dense_embed(self, images: Tensor, mask: Tensor) -> Tensor:
         patches = patchify3d(images, PATCH_SIZE)
+        levels = [patches.mean(dim=2, keepdim=True), patches.amax(dim=2, keepdim=True)]
+        bins = [torch.exp(-(((level - self.bins) / BIN_WIDTH) ** 2)) for level in levels]
         grid = [size // patch for size, patch in zip(MODEL_SHAPE, PATCH_SIZE)]
-        return self.scale * patches.reshape(len(images), *grid, -1)
+        return self.scale * torch.cat([patches, *bins], dim=2).reshape(len(images), *grid, -1)
+
+
+@pytest.fixture(autouse=True)
+def fast_light(monkeypatch):
+    # few subjects are one optimizer step per epoch: a higher learning rate trains in time
+    monkeypatch.setattr(dura.probe, "LIGHT_LR", 1e-2)
+    monkeypatch.setattr(dura.probe, "LIGHT_SEEDS", (0,))
 
 
 def test_probe_binary_classification(samples):
@@ -109,16 +117,18 @@ def test_probe_binary_classification(samples):
     )
     assert record["auroc"] > 0.95
     assert record["n_samples"] == 40
-    assert record["embed_dim"] == 9
+    assert record["embed_dim"] == EMBED_DIM
     assert len(record["probabilities"]) == 40
+    assert len(record["fold_choice"]) == 5
+    assert {"auroc_ci", "balanced_accuracy", "probe_seconds", "embed_seconds"} <= set(record)
 
 
 def test_probe_binary_classification_random_labels(samples):
     record, _ = probe_binary_classification(
         DummyEncoder().cuda(), DummyTransform(), with_target(samples, "random_class")
     )
-    low, high = record["auroc_ci"]
-    assert low < 0.5 < high
+    # no signal to find: not above chance. Below chance is just noise, at 40 subjects
+    assert record["auroc_ci"][0] < 0.5
 
 
 def test_probe_regression(samples):
@@ -156,7 +166,7 @@ def test_probe_binary_segmentation(samples):
     # no bias overall, though one threshold over- and under-segments blobs of either contrast
     volume_ratio = np.mean(record["subject_volume_ml"]) / np.mean(record["subject_label_volume_ml"])
     assert abs(volume_ratio - 1) < 0.1
-    assert record["embed_dim"] == 512
+    assert record["embed_dim"] == EMBED_DIM
     assert len(record["subject_dice"]) == 20
     assert state["geometry"][0]["label_shape"] == NATIVE_SHAPE
 

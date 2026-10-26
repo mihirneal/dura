@@ -7,12 +7,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from sklearn.linear_model import LogisticRegressionCV, RidgeCV
 from sklearn.metrics import balanced_accuracy_score, mean_absolute_error, r2_score, roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold
-from sklearn.pipeline import Pipeline, make_pipeline
-from sklearn.preprocessing import StandardScaler
-from torch import Tensor
+from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
 from dura.data import NiftiDataset, collate, fit_transform
@@ -20,12 +17,24 @@ from dura.models.base import ModelTransform, ModelWrapper
 
 CV_SEED = 0
 N_BOOTSTRAP = 1000
-LOGISTIC_CS = np.logspace(-4, 4, 9)
-RIDGE_ALPHAS = np.logspace(-2, 6, 9)
 SEGMENTATION_ALPHAS = (1e1, 1e2, 1e3, 1e4, 1e5)
 SEGMENTATION_THRESHOLDS = torch.logspace(-3, -0.1, 30)
 # rows per chunk of the logistic loss, so large training sets fit in memory
 LOGISTIC_CHUNK = 2**18
+# light attention probe (the global tasks): one learned query pools the model's dense tokens.
+# Weight decay and epochs by inner CV, then refit with each seed
+LIGHT_LR = 1e-3
+LIGHT_WEIGHT_DECAYS = (0.05, 0.5, 5.0)
+LIGHT_MAX_EPOCHS = 150
+# inner CV stops a fit after this many epochs without a better validation loss
+LIGHT_PATIENCE = 20
+LIGHT_WARMUP_EPOCHS = 3
+LIGHT_BATCH_SIZE = 32
+# subjects per forward pass, which bounds memory; the gradient is the whole batch's
+LIGHT_MICRO_BATCH = 8
+# fraction of each subject's tokens dropped per training step
+LIGHT_TOKEN_DROP = 0.5
+LIGHT_SEEDS = (0, 1, 2)
 
 
 def probe_binary_classification(
@@ -39,11 +48,11 @@ def probe_binary_classification(
     amp: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
-    Linear probe for binary classification on the global embedding. Logistic regression with
-    the penalty tuned by inner CV. Scores pooled out-of-fold predictions with bootstrap CIs.
+    Light attention probe for binary classification. Scores pooled out-of-fold probabilities by
+    AUROC with bootstrap CIs.
     """
     return probe_global(
-        fit_score_binary, model, transform, samples, n_folds, batch_size, num_workers, device, amp
+        "binary", model, transform, samples, n_folds, batch_size, num_workers, device, amp
     )
 
 
@@ -58,18 +67,10 @@ def probe_multiclass_classification(
     amp: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
-    Linear probe for labels 0..K-1 on the global embedding, scored by macro one-vs-rest AUROC.
+    Light attention probe for labels 0..K-1, scored by macro one-vs-rest AUROC.
     """
     return probe_global(
-        fit_score_multiclass,
-        model,
-        transform,
-        samples,
-        n_folds,
-        batch_size,
-        num_workers,
-        device,
-        amp,
+        "multiclass", model, transform, samples, n_folds, batch_size, num_workers, device, amp
     )
 
 
@@ -84,24 +85,16 @@ def probe_regression(
     amp: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
-    Linear probe for regression on the global embedding. Ridge regression with the penalty
-    tuned by leave-one-out. Scores pooled out-of-fold predictions with bootstrap CIs.
+    Light attention probe for regression. Scores pooled out-of-fold predictions by R2 with
+    bootstrap CIs.
     """
     return probe_global(
-        fit_score_regression,
-        model,
-        transform,
-        samples,
-        n_folds,
-        batch_size,
-        num_workers,
-        device,
-        amp,
+        "regression", model, transform, samples, n_folds, batch_size, num_workers, device, amp
     )
 
 
 def probe_global(
-    fit_score: Callable[[np.ndarray, np.ndarray, int], dict[str, Any]],
+    kind: str,
     model: ModelWrapper,
     transform: ModelTransform,
     samples: list[dict[str, Any]],
@@ -111,18 +104,17 @@ def probe_global(
     device: str,
     amp: bool,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Global embeddings scored with fit_score."""
-    features, targets, embed_seconds = embed_global(
+    """The light attention probe of the given kind on the model's dense tokens."""
+    tokens, targets, embed_seconds = embed_tokens(
         model, transform, samples, batch_size, num_workers, device, amp
     )
-    result = fit_score(features, targets, n_folds)
+    result = fit_score_light(tokens, targets, kind, n_folds)
     result["n_params"] = sum(p.numel() for p in model.parameters())
     result["embed_seconds"] = embed_seconds
-    state = {"features": features}
-    return result, state
+    return result, {}
 
 
-def embed_global(
+def embed_tokens(
     model: ModelWrapper,
     transform: ModelTransform,
     samples: list[dict[str, Any]],
@@ -130,14 +122,15 @@ def embed_global(
     num_workers: int,
     device: str,
     amp: bool,
-) -> tuple[np.ndarray, np.ndarray, float]:
-    """Global embeddings [N D], targets [N] and seconds spent embedding."""
+) -> tuple[list[Tensor], np.ndarray, float]:
+    """Each subject's dense tokens of the patches that overlap the mask ([N_i D] bf16, on the
+    device), targets [N] and seconds spent embedding."""
     device_type = torch.device(device).type
     model.eval()
     fit_transform(transform, samples)
     dataset = NiftiDataset(samples, transform)
     loader = DataLoader(dataset, batch_size, num_workers=num_workers, collate_fn=collate)
-    embeddings = []
+    tokens = []
     targets = []
     embed_seconds = 0.0
     with torch.inference_mode(), torch.autocast(device_type, dtype=torch.bfloat16, enabled=amp):
@@ -145,30 +138,265 @@ def embed_global(
             images = batch["image"].to(device)
             masks = batch["mask"].to(device)
             start = time.perf_counter()
-            embedding = model.global_embed(images, masks).float().cpu()
+            embedding = model.dense_embed(images, masks).float()
+            if device_type == "cuda":
+                torch.cuda.synchronize()
             embed_seconds += time.perf_counter() - start
-            assert embedding.ndim == 2 and len(embedding) == len(images), (
-                f"unexpected global embedding shape {embedding.shape}"
+            assert embedding.ndim == 5 and len(embedding) == len(images), (
+                f"unexpected dense embedding shape {embedding.shape}"
             )
-            embeddings.append(embedding)
+            patch_size = patch_size_for(tuple(masks.shape[1:]), tuple(embedding.shape[1:4]))
+            in_mask = patchify3d(masks, patch_size).any(dim=2)
+            embedding = embedding.flatten(1, 3)
+            for ii in range(len(images)):
+                tokens.append(embedding[ii, in_mask[ii]].to(torch.bfloat16))
             targets.append(batch["target"])
-    return torch.cat(embeddings).numpy(), torch.cat(targets).numpy(), embed_seconds
+    return tokens, torch.cat(targets).numpy(), embed_seconds
 
 
-def fit_score_binary(features: np.ndarray, labels: np.ndarray, n_folds: int = 5) -> dict[str, Any]:
-    """Logistic regression in n_folds CV, pooled out-of-fold scores with bootstrap CIs."""
-    assert set(np.unique(labels)) == {0, 1}, "expected binary labels"
+class LightAttention(nn.Module):
+    """
+    Light attention probe: a learned query scores each layer-normed token, a softmax over the
+    tokens weights their average, and a linear head reads it out. No key or value projections:
+    with one query they fold into the query and the head. The prediction splits exactly into
+    per-token terms, so the softmax weights are an attention map.
+    """
+
+    def __init__(self, dim: int, out_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.query = nn.Parameter(torch.randn(1, dim) * dim**-0.5)
+        self.head = nn.Linear(dim, out_dim)
+
+    def forward(self, tokens: Tensor, pad: Tensor) -> Tensor:
+        """tokens [B L D], pad [B L] (True where there is no token) -> [B out_dim]."""
+        tokens = self.norm(tokens)
+        logits = torch.einsum("bld,hd->bhl", tokens, self.query).masked_fill(
+            pad[:, None], -torch.inf
+        )
+        pooled = torch.einsum("bhl,bld->bhd", logits.softmax(-1), tokens)
+        return self.head(pooled.flatten(1))
+
+
+class TokenStore:
+    """All subjects' standardized tokens in one flat [T D] bf16 tensor, so subjects with many
+    tokens (e.g. patch 4) don't pad every subject to the longest one."""
+
+    def __init__(self, tokens: list[Tensor], train_ids: np.ndarray):
+        # standardized by the train subjects' token mean and std, per channel
+        total = torch.zeros(tokens[0].shape[1], dtype=torch.float64, device=tokens[0].device)
+        total_sq = torch.zeros_like(total)
+        count = 0
+        for ii in train_ids:
+            t = tokens[ii].double()
+            total += t.sum(0)
+            total_sq += (t * t).sum(0)
+            count += len(t)
+        mean = total / count
+        std = (total_sq / count - mean**2).clamp_min(1e-12).sqrt().float()
+        mean = mean.float()
+        self.lengths = torch.tensor([len(t) for t in tokens], device=tokens[0].device)
+        self.offsets = torch.cat([self.lengths.new_zeros(1), self.lengths.cumsum(0)[:-1]])
+        self.flat = torch.empty(
+            int(self.lengths.sum()),
+            tokens[0].shape[1],
+            dtype=torch.bfloat16,
+            device=tokens[0].device,
+        )
+        start = 0
+        for t in tokens:
+            self.flat[start : start + len(t)] = ((t.float() - mean) / std).bfloat16()
+            start += len(t)
+        self.dim = self.flat.shape[1]
+
+    def batch(self, ids: Tensor, drop: float = 0.0) -> tuple[Tensor, Tensor]:
+        """Padded tokens [B L D] and their padding mask [B L], dropping a random drop fraction."""
+        lengths = self.lengths[ids]
+        positions = torch.arange(int(lengths.max()), device=ids.device)[None]
+        pad = positions >= lengths[:, None]
+        index = (self.offsets[ids][:, None] + positions).clamp_max(len(self.flat) - 1)
+        tokens = self.flat[index]
+        if drop > 0:
+            pad = pad | (torch.rand(pad.shape, device=ids.device) < drop)
+            # keep at least one token per subject
+            pad[:, 0] = pad[:, 0] & (lengths == 0)
+        return tokens, pad
+
+
+def light_loss(kind: str, y: Tensor, train_ids: np.ndarray) -> Callable[[Tensor, Tensor], Tensor]:
+    """MSE on standardized targets, or class-balanced binary / multiclass cross-entropy (like the
+    logistic probes' class_weight="balanced")."""
+    if kind == "regression":
+        return lambda output, target: F.mse_loss(output.float().squeeze(-1), target)
+    labels = y[torch.as_tensor(train_ids, device=y.device)].long()
+    counts = torch.bincount(labels).float()
+    class_weight = counts.sum() / (len(counts) * counts)
+    if kind == "binary":
+
+        def binary_loss(output: Tensor, target: Tensor) -> Tensor:
+            weight = class_weight[target.long()]
+            loss = F.binary_cross_entropy_with_logits(
+                output.float().squeeze(-1), target, reduction="none"
+            )
+            return (loss * weight).sum() / weight.sum()
+
+        return binary_loss
+    return lambda output, target: F.cross_entropy(
+        output.float(), target.long(), weight=class_weight
+    )
+
+
+def train_light(
+    store: TokenStore,
+    y: Tensor,
+    train_ids: np.ndarray,
+    weight_decay: float,
+    epochs: int,
+    seed: int,
+    kind: str,
+    eval_ids: np.ndarray | None = None,
+) -> tuple[LightAttention, list[float]]:
+    """Train on train_ids; with eval_ids also the eval loss after every epoch, stopping after
+    LIGHT_PATIENCE epochs without improvement (the curve then holds its last value)."""
+    device = store.flat.device
+    torch.manual_seed(seed)
+    out_dim = int(y.max().item()) + 1 if kind == "multiclass" else 1
+    model = LightAttention(store.dim, out_dim).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LIGHT_LR, weight_decay=weight_decay)
+    steps_per_epoch = math.ceil(len(train_ids) / LIGHT_BATCH_SIZE)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambda step: min(1.0, (step + 1) / (LIGHT_WARMUP_EPOCHS * steps_per_epoch))
+    )
+    loss_fn = light_loss(kind, y, train_ids)
+    generator = torch.Generator().manual_seed(seed)
+    curve = []
+    for _ in range(epochs):
+        stalled = len(curve) > LIGHT_PATIENCE and min(curve[-LIGHT_PATIENCE:]) > min(curve)
+        if eval_ids is not None and stalled:
+            curve += [curve[-1]] * (epochs - len(curve))
+            break
+        model.train()
+        order = train_ids[torch.randperm(len(train_ids), generator=generator).numpy()]
+        for start in range(0, len(order), LIGHT_BATCH_SIZE):
+            ids = torch.as_tensor(order[start : start + LIGHT_BATCH_SIZE], device=device)
+            optimizer.zero_grad(set_to_none=True)
+            for micro in ids.split(LIGHT_MICRO_BATCH):
+                tokens, pad = store.batch(micro, LIGHT_TOKEN_DROP)
+                with torch.autocast(device.type, dtype=torch.bfloat16):
+                    output = model(tokens, pad)
+                loss = loss_fn(output, y[micro]) * len(micro) / len(ids)
+                loss.backward()
+            optimizer.step()
+            scheduler.step()
+        if eval_ids is not None:
+            output = predict_light(model, store, eval_ids)
+            curve.append(loss_fn(output, y[torch.as_tensor(eval_ids, device=device)]).item())
+    return model, curve
+
+
+@torch.no_grad()
+def predict_light(model: LightAttention, store: TokenStore, ids: np.ndarray) -> Tensor:
+    """Raw outputs [N out_dim] for the subjects in ids."""
+    model.eval()
+    device = store.flat.device
+    outputs = []
+    for start in range(0, len(ids), LIGHT_MICRO_BATCH):
+        micro = torch.as_tensor(ids[start : start + LIGHT_MICRO_BATCH], device=device)
+        tokens, pad = store.batch(micro)
+        with torch.autocast(device.type, dtype=torch.bfloat16):
+            outputs.append(model(tokens, pad).float())
+    return torch.cat(outputs)
+
+
+def light_folds(kind: str, n_folds: int) -> KFold | StratifiedKFold:
+    """The probe's folds: stratified for classification."""
+    if kind == "regression":
+        return KFold(n_folds, shuffle=True, random_state=CV_SEED)
+    return StratifiedKFold(n_folds, shuffle=True, random_state=CV_SEED)
+
+
+def fit_score_light(
+    tokens: list[Tensor], targets: np.ndarray, kind: str, n_folds: int = 5
+) -> dict[str, Any]:
+    """
+    Light attention probe in n_folds CV: weight decay and epochs by inner CV on each outer train
+    split (seed 0), then refit with each of LIGHT_SEEDS. Scores the seeds' mean out-of-fold
+    prediction with bootstrap CIs.
+    """
+    n_samples = len(targets)
+    if kind == "regression":
+        targets = np.asarray(targets, dtype=np.float64)
+        labels = None
+        predictions = np.zeros(n_samples)
+    else:
+        targets = np.asarray(targets).astype(int)
+        n_classes = len(np.unique(targets))
+        assert set(np.unique(targets)) == set(range(n_classes)), "expected labels 0..K-1"
+        assert (n_classes == 2) == (kind == "binary"), f"{n_classes} classes for a {kind} probe"
+        labels = targets
+        predictions = np.zeros(n_samples if kind == "binary" else (n_samples, n_classes))
+    folds = light_folds(kind, n_folds)
+    fold_choices = []
+    start = time.perf_counter()
+    for train_ids, test_ids in folds.split(np.arange(n_samples), labels):
+        store = TokenStore(tokens, train_ids)
+        # regression targets standardized by the train split, so one learning rate fits all tasks
+        mu, sd = (
+            (targets[train_ids].mean(), targets[train_ids].std())
+            if kind == "regression"
+            else (0.0, 1.0)
+        )
+        y = torch.as_tensor((targets - mu) / sd, dtype=torch.float32, device=store.flat.device)
+        inner = light_folds(kind, n_folds)
+        inner_labels = None if labels is None else labels[train_ids]
+        best = (np.inf, None, None)
+        for weight_decay in LIGHT_WEIGHT_DECAYS:
+            curves = [
+                train_light(
+                    store,
+                    y,
+                    train_ids[fit],
+                    weight_decay,
+                    LIGHT_MAX_EPOCHS,
+                    0,
+                    kind,
+                    train_ids[val],
+                )[1]
+                for fit, val in inner.split(train_ids, inner_labels)
+            ]
+            curve = np.mean(curves, axis=0)
+            if curve.min() < best[0]:
+                best = (float(curve.min()), weight_decay, int(curve.argmin()) + 1)
+        inner_loss, weight_decay, epochs = best
+        outputs = []
+        for seed in LIGHT_SEEDS:
+            model, _ = train_light(store, y, train_ids, weight_decay, epochs, seed, kind)
+            outputs.append(predict_light(model, store, test_ids))
+        output = torch.stack(outputs)
+        if kind == "regression":
+            predictions[test_ids] = (output.squeeze(-1).mean(0) * sd + mu).cpu().numpy()
+        elif kind == "binary":
+            predictions[test_ids] = output.squeeze(-1).sigmoid().mean(0).cpu().numpy()
+        else:
+            predictions[test_ids] = output.softmax(-1).mean(0).cpu().numpy()
+        fold_choices.append(
+            {"weight_decay": weight_decay, "epochs": epochs, "inner_loss": inner_loss}
+        )
+        del store
+    score = {"binary": score_binary, "multiclass": score_multiclass, "regression": score_regression}
+    return {
+        **score[kind](targets, predictions),
+        "fold_choice": fold_choices,
+        "probe_seconds": time.perf_counter() - start,
+        "n_probe_params": sum(p.numel() for p in model.parameters()),
+        "embed_dim": tokens[0].shape[1],
+    }
+
+
+def score_binary(labels: np.ndarray, probabilities: np.ndarray) -> dict[str, Any]:
+    """AUROC and balanced accuracy (at 0.5) of pooled out-of-fold probabilities, bootstrap CIs."""
     n_samples = len(labels)
-    probabilities = np.zeros(n_samples)
-    fold_Cs = []
-    folds = StratifiedKFold(n_folds, shuffle=True, random_state=CV_SEED)
-    for train_ids, test_ids in folds.split(features, labels):
-        classifier = logistic_classifier()
-        classifier.fit(features[train_ids], labels[train_ids])
-        probabilities[test_ids] = classifier.predict_proba(features[test_ids])[:, 1]
-        fold_Cs.append(float(classifier[-1].C_))
     predictions = probabilities > 0.5
-
     rng = np.random.default_rng(0)
     bootstrap_auroc = []
     bootstrap_balanced_accuracy = []
@@ -185,33 +413,16 @@ def fit_score_binary(features: np.ndarray, labels: np.ndarray, n_folds: int = 5)
         "auroc_ci": np.percentile(bootstrap_auroc, [2.5, 97.5]).tolist(),
         "balanced_accuracy": balanced_accuracy_score(labels, predictions),
         "balanced_accuracy_ci": np.percentile(bootstrap_balanced_accuracy, [2.5, 97.5]).tolist(),
-        "fold_C": fold_Cs,
         "labels": labels.tolist(),
         "probabilities": probabilities.tolist(),
         "n_samples": n_samples,
-        "embed_dim": features.shape[1],
     }
 
 
-def fit_score_multiclass(
-    features: np.ndarray, labels: np.ndarray, n_folds: int = 5
-) -> dict[str, Any]:
-    """Multinomial logistic regression, scored like fit_score_binary."""
-    n_classes = len(np.unique(labels))
-    assert n_classes > 2 and set(np.unique(labels)) == set(range(n_classes)), (
-        "expected labels 0..K-1 with K > 2, use probe_binary_classification for two classes"
-    )
-    n_samples = len(labels)
-    probabilities = np.zeros((n_samples, n_classes))
-    fold_Cs = []
-    folds = StratifiedKFold(n_folds, shuffle=True, random_state=CV_SEED)
-    for train_ids, test_ids in folds.split(features, labels):
-        classifier = logistic_classifier()
-        classifier.fit(features[train_ids], labels[train_ids])
-        probabilities[test_ids] = classifier.predict_proba(features[test_ids])
-        fold_Cs.append(float(classifier[-1].C_))
+def score_multiclass(labels: np.ndarray, probabilities: np.ndarray) -> dict[str, Any]:
+    """Macro one-vs-rest AUROC and balanced accuracy (argmax), bootstrap CIs."""
+    n_samples, n_classes = probabilities.shape
     predictions = probabilities.argmax(axis=1)
-
     rng = np.random.default_rng(0)
     bootstrap_auroc = []
     bootstrap_balanced_accuracy = []
@@ -229,29 +440,15 @@ def fit_score_multiclass(
         "class_auroc": [roc_auc_score(labels == k, probabilities[:, k]) for k in range(n_classes)],
         "balanced_accuracy": balanced_accuracy_score(labels, predictions),
         "balanced_accuracy_ci": np.percentile(bootstrap_balanced_accuracy, [2.5, 97.5]).tolist(),
-        "fold_C": fold_Cs,
         "labels": labels.tolist(),
         "probabilities": probabilities.tolist(),
         "n_samples": n_samples,
-        "embed_dim": features.shape[1],
     }
 
 
-def fit_score_regression(
-    features: np.ndarray, targets: np.ndarray, n_folds: int = 5
-) -> dict[str, Any]:
-    """Ridge in n_folds CV, pooled out-of-fold scores with bootstrap CIs."""
-    targets = np.asarray(targets, dtype=np.float64)
+def score_regression(targets: np.ndarray, predictions: np.ndarray) -> dict[str, Any]:
+    """MAE, Pearson r and R2 of pooled out-of-fold predictions, bootstrap CIs."""
     n_samples = len(targets)
-    predictions = np.zeros(n_samples)
-    fold_alphas = []
-    folds = KFold(n_folds, shuffle=True, random_state=CV_SEED)
-    for train_ids, test_ids in folds.split(features):
-        regressor = make_pipeline(StandardScaler(), RidgeCV(alphas=RIDGE_ALPHAS))
-        regressor.fit(features[train_ids], targets[train_ids])
-        predictions[test_ids] = regressor.predict(features[test_ids])
-        fold_alphas.append(float(regressor[-1].alpha_))
-
     rng = np.random.default_rng(0)
     bootstrap_mae = []
     bootstrap_r = []
@@ -269,27 +466,10 @@ def fit_score_regression(
         "r_ci": np.percentile(bootstrap_r, [2.5, 97.5]).tolist(),
         "r2": r2_score(targets, predictions),
         "r2_ci": np.percentile(bootstrap_r2, [2.5, 97.5]).tolist(),
-        "fold_alpha": fold_alphas,
         "targets": targets.tolist(),
         "predictions": predictions.tolist(),
         "n_samples": n_samples,
-        "embed_dim": features.shape[1],
     }
-
-
-def logistic_classifier() -> Pipeline:
-    return make_pipeline(
-        StandardScaler(),
-        LogisticRegressionCV(
-            Cs=LOGISTIC_CS,
-            l1_ratios=(0.0,),
-            scoring="neg_log_loss",
-            # so 0.5 / argmax is a sensible cutoff
-            class_weight="balanced",
-            max_iter=1000,
-            use_legacy_attributes=False,
-        ),
-    )
 
 
 def probe_binary_segmentation(
@@ -347,7 +527,8 @@ def probe_binary_segmentation(
             for ii in range(len(images)):
                 in_mask = mask_patches[ii].any(dim=1)
                 patch_in_mask.append(in_mask.cpu())
-                patch_features.append(embedding[ii, in_mask])
+                # bf16 on the cpu: patch 4 features of a large cohort don't fit on the gpu
+                patch_features.append(embedding[ii, in_mask].to(torch.bfloat16).cpu())
                 patch_labels.append(label_patches[ii, in_mask])
                 geometry.append(
                     {
@@ -478,11 +659,16 @@ def fit_predict_segmentation(
     max_negative_ratio: float | None = None,
 ) -> list[Tensor]:
     """Fit on the train subjects' patches, return per-patch probabilities for each test subject."""
-    train_features = torch.cat([patch_features[ii] for ii in train_ids])
+    device = patch_labels[train_ids[0]].device
     train_labels = torch.cat([patch_labels[ii] for ii in train_ids])
+    keep = torch.ones(len(train_labels), dtype=torch.bool, device=device)
     if max_negative_ratio is not None:
-        keep_ids = subsample_negatives(train_labels, max_negative_ratio)
-        train_features, train_labels = train_features[keep_ids], train_labels[keep_ids]
+        keep = subsample_negatives(train_labels, max_negative_ratio)
+    # only each subject's kept rows go to the device, as float32
+    keeps = keep.cpu().split([len(patch_labels[ii]) for ii in train_ids])
+    train_features = torch.cat([patch_features[ii][k] for ii, k in zip(train_ids, keeps)])
+    train_features = train_features.float().to(device)
+    train_labels = train_labels[keep]
     mean = train_features.mean(dim=0)
     std = train_features.std(dim=0, correction=0).clamp_min(1e-6)
     # in place: train_features is a copy
@@ -490,24 +676,22 @@ def fit_predict_segmentation(
 
     probabilities = []
     for ii in test_ids:
-        logits = (patch_features[ii] - mean) / std @ coef + intercept
+        logits = (patch_features[ii].to(device).float() - mean) / std @ coef + intercept
         probabilities.append(torch.sigmoid(logits))
     return probabilities
 
 
-def subsample_negatives(
-    labels: Tensor,
-    max_negative_ratio: float,
-) -> tuple[Tensor, Tensor]:
-    """Keep every row with a positive label and at most max_negative_ratio negatives per positive."""
+def subsample_negatives(labels: Tensor, max_negative_ratio: float) -> Tensor:
+    """Which rows to keep: every row with a positive label and at most max_negative_ratio
+    negatives per positive."""
     positive = labels.sum(dim=1) > 0
-    positive_ids = positive.nonzero()[:, 0]
     negative_ids = (~positive).nonzero()[:, 0]
-    n_negative = min(len(negative_ids), int(max_negative_ratio * len(positive_ids)))
+    n_negative = min(len(negative_ids), int(max_negative_ratio * positive.sum()))
     generator = torch.Generator().manual_seed(CV_SEED)
     order = torch.randperm(len(negative_ids), generator=generator).to(negative_ids.device)
-    keep_ids = torch.cat([positive_ids, negative_ids[order[:n_negative]]])
-    return keep_ids
+    keep = positive.clone()
+    keep[negative_ids[order[:n_negative]]] = True
+    return keep
 
 
 def dice_by_threshold(
@@ -593,7 +777,7 @@ def fit_logistic(
     features: Tensor,
     targets: Tensor,
     alpha: float,
-    max_iter: int = 1000,
+    max_iter: int = 5000,
 ) -> tuple[Tensor, Tensor]:
     """
     L2 penalized logistic regression fit with L-BFGS. Each target column is a separate binary

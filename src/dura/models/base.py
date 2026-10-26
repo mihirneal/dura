@@ -8,14 +8,9 @@ from torch import Tensor, nn
 
 class ModelWrapper(nn.Module):
     """
-    Wrap an sMRI encoder model. Takes a batch of transformed images and returns embeddings.
+    Wrap an sMRI encoder model. Takes a batch of transformed images and returns patch
+    embeddings, which every probe reads.
     """
-
-    def global_embed(
-        self,
-        images: Float[Tensor, "B ... X Y Z"],
-        mask: Float[Tensor, "B X Y Z"],
-    ) -> Float[Tensor, "B D"]: ...
 
     def dense_embed(
         self,
