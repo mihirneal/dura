@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from dura.models.registry import create_model, list_models
+from dura.probe import Embedder
 from dura.tasks import TASKS
 
 logger = logging.getLogger(__name__)
@@ -53,7 +54,15 @@ if __name__ == "__main__":
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model_kwargs = dict(kv.split("=", 1) for kv in args.model_kwargs)
     transform, model = create_model(args.model, **model_kwargs)
-    model = model.to(args.device)
+    # kept across tasks: consecutive tasks on the same images embed them once
+    embedder = Embedder(
+        model.to(args.device),
+        transform,
+        args.batch_size,
+        args.num_workers,
+        args.device,
+        not args.no_amp,
+    )
 
     for task in args.tasks:
         output_path = args.output_dir / f"{task}.json"
@@ -62,15 +71,7 @@ if __name__ == "__main__":
             continue
         logger.info(f"running {task}")
         start = time.perf_counter()
-        probe = TASKS[task]()
-        result, _ = probe(
-            model,
-            transform,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            device=args.device,
-            amp=not args.no_amp,
-        )
+        result, _ = TASKS[task]()(embedder)
         result = {
             "task": task,
             "model": args.model,

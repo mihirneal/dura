@@ -133,6 +133,7 @@ def adni_cortex() -> Probe:
     return adni_anatomy_label(SYNTHSEG_CORTEX)
 
 
+# tasks on the same images are listed together: run in this order, they share one embedding
 TASKS: dict[str, Callable[[], Probe]] = {
     task.__name__: task
     for task in [
@@ -140,14 +141,14 @@ TASKS: dict[str, Callable[[], Probe]] = {
         ucsf_bmsr_t1c_edema,
         ucsf_bmsr_flair_edema,
         adni_diagnosis,
-        adni_mci_conversion,
-        adni_wmh_flair,
-        adni_wmh_t1,
         adni_hippocampus,
         adni_amygdala,
         adni_temporal_horns,
         adni_lateral_ventricles,
         adni_cortex,
+        adni_mci_conversion,
+        adni_wmh_flair,
+        adni_wmh_t1,
     ]
 }
 
@@ -157,12 +158,12 @@ HEADLINE_METRICS: dict[str, str] = {
     "ucsf_bmsr_flair_edema": "dice",
     # macro one-vs-rest
     "adni_diagnosis": "auroc",
-    "adni_mci_conversion": "auroc",
-    "adni_wmh_flair": "r2",
-    "adni_wmh_t1": "r2",
     "adni_hippocampus": "dice",
     "adni_amygdala": "dice",
     "adni_temporal_horns": "dice",
     "adni_lateral_ventricles": "dice",
     "adni_cortex": "dice",
+    "adni_mci_conversion": "auroc",
+    "adni_wmh_flair": "r2",
+    "adni_wmh_t1": "r2",
 }

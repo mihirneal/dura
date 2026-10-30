@@ -8,6 +8,7 @@ from torch import Tensor
 import dura.probe
 from dura.models.base import ModelTransform, ModelWrapper
 from dura.probe import (
+    Embedder,
     patchify3d,
     probe_binary_classification,
     probe_binary_segmentation,
@@ -113,19 +114,19 @@ def fast_light(monkeypatch):
 
 def test_probe_binary_classification(samples):
     record, _ = probe_binary_classification(
-        DummyEncoder().cuda(), DummyTransform(), with_target(samples, "class")
+        Embedder(DummyEncoder().cuda(), DummyTransform()), with_target(samples, "class")
     )
     assert record["auroc"] > 0.95
     assert record["n_samples"] == 40
     assert record["embed_dim"] == EMBED_DIM
     assert len(record["probabilities"]) == 40
     assert len(record["fold_choice"]) == 5
-    assert {"auroc_ci", "balanced_accuracy", "probe_seconds", "embed_seconds"} <= set(record)
+    assert {"auroc_ci", "balanced_accuracy"} <= set(record)
 
 
 def test_probe_binary_classification_random_labels(samples):
     record, _ = probe_binary_classification(
-        DummyEncoder().cuda(), DummyTransform(), with_target(samples, "random_class")
+        Embedder(DummyEncoder().cuda(), DummyTransform()), with_target(samples, "random_class")
     )
     # no signal to find: not above chance. Below chance is just noise, at 40 subjects
     assert record["auroc_ci"][0] < 0.5
@@ -133,7 +134,7 @@ def test_probe_binary_classification_random_labels(samples):
 
 def test_probe_regression(samples):
     record, _ = probe_regression(
-        DummyEncoder().cuda(), DummyTransform(), with_target(samples, "age")
+        Embedder(DummyEncoder().cuda(), DummyTransform()), with_target(samples, "age")
     )
     assert record["r"] > 0.9
     assert record["mae"] < 10
@@ -141,7 +142,7 @@ def test_probe_regression(samples):
 
 def test_probe_multiclass_classification(samples):
     record, _ = probe_multiclass_classification(
-        DummyEncoder().cuda(), DummyTransform(), with_target(samples, "age_group")
+        Embedder(DummyEncoder().cuda(), DummyTransform()), with_target(samples, "age_group")
     )
     assert record["auroc"] > 0.9
     assert len(record["class_auroc"]) == 3
@@ -153,7 +154,7 @@ def test_probe_binary_segmentation(samples):
         {"subject": s["subject"], "image": s["image"], "label": s["label"]} for s in samples[:20]
     ]
     record, state = probe_binary_segmentation(
-        DummyEncoder().cuda(), DummyTransform(), samples, label_fn=lambda x: x
+        Embedder(DummyEncoder().cuda(), DummyTransform()), samples, label_fn=lambda x: x
     )
     # dice is limited by partial volume at the blob edge, upsampled from 2mm slices
     assert record["model_grid_dice"] > 0.85
@@ -187,3 +188,12 @@ def test_to_native_flip():
     native, labels = to_native(probabilities, torch.ones(8, dtype=torch.bool), geometry)
     assert torch.allclose(native, volume.flip(0).flatten(), atol=1e-5)
     assert labels.nonzero().flatten().tolist() == [0, 5]
+
+
+def test_embedder_reuses_tokens(samples):
+    embedder = Embedder(DummyEncoder().cuda(), DummyTransform())
+    first = embedder(with_target(samples, "class"))
+    # the same images in another order and with other targets: embedded once
+    again = embedder(with_target(samples[::-1], "age"))
+    assert all(a is b for a, b in zip(again, first[::-1]))
+    assert embedder(with_target(samples[:10], "class"))[0] is not first[0]

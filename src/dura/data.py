@@ -15,58 +15,63 @@ from dura.models.base import ModelTransform
 DATA_ROOT = Path(os.getenv("DURA_DATA_ROOT", "/data/mihir-stuff/dura"))
 
 
-class NiftiDataset(Dataset):
-    """Raw nii.gz images, preprocessed on the fly by the model's transform.
+class ImageDataset(Dataset):
+    """Raw nii.gz images, preprocessed on the fly by the model's transform."""
 
-    Each sample is a dict with "subject", "image" (a nii.gz path) and either a scalar "target"
-    or a "label" nii.gz path for segmentation. Labels are mapped to a binary array by label_fn
-    and resampled (nearest) onto the transformed image grid as "target". Their native geometry
-    is kept as "label_shape", "label_affine" and "label_positive" (flat indices of the
-    positive voxels) so predictions can be scored in native space.
+    def __init__(self, images: list[Path], transform: ModelTransform):
+        self.images = images
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        transformed = self.transform(nib.load(self.images[index]))
+        return {
+            "image": torch.as_tensor(transformed["image"], dtype=torch.float32),
+            "mask": torch.as_tensor(transformed["mask"], dtype=torch.float32),
+            "affine": np.asarray(transformed["affine"], dtype=np.float64),
+        }
+
+
+class LabelDataset(Dataset):
+    """
+    Segmentation labels (nii.gz paths), mapped to a binary array by label_fn and resampled
+    (nearest) onto each image's model grid (shape, affine) as "target". Their native geometry is
+    kept as "label_shape", "label_affine" and "label_positive" (flat indices of the positive
+    voxels) so predictions can be scored in native space.
     """
 
     def __init__(
         self,
-        samples: list[dict[str, Any]],
-        transform: ModelTransform,
-        label_fn: Callable[[np.ndarray], np.ndarray] | None = None,
+        labels: list[Path],
+        grids: list[tuple[tuple[int, ...], np.ndarray]],
+        label_fn: Callable[[np.ndarray], np.ndarray],
     ):
-        self.samples = samples
-        self.transform = transform
+        self.labels = labels
+        self.grids = grids
         self.label_fn = label_fn
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.labels)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
-        sample = self.samples[index]
-        transformed = self.transform(nib.load(sample["image"]))
-        image = torch.as_tensor(transformed["image"], dtype=torch.float32)
-        affine = np.asarray(transformed["affine"], dtype=np.float64)
-        item = {
-            "subject": sample["subject"],
-            "image": image,
-            "mask": torch.as_tensor(transformed["mask"], dtype=torch.float32),
-            "affine": affine,
+        label_img = nib.load(self.labels[index])
+        label = self.label_fn(np.asarray(label_img.dataobj)).astype(np.uint8)
+        label_img = nib.Nifti1Image(label, label_img.affine)
+        fit_label = resample_from_to(label_img, self.grids[index], order=0)
+        return {
+            "target": torch.as_tensor(np.asarray(fit_label.dataobj), dtype=torch.uint8),
+            "label_shape": label.shape,
+            "label_affine": label_img.affine,
+            "label_positive": np.flatnonzero(label),
         }
-        if "label" in sample:
-            label_img = nib.load(sample["label"])
-            label = self.label_fn(np.asarray(label_img.dataobj)).astype(np.uint8)
-            label_img = nib.Nifti1Image(label, label_img.affine)
-            fit_label = resample_from_to(label_img, (image.shape[-3:], affine), order=0)
-            item["target"] = torch.as_tensor(np.asarray(fit_label.dataobj), dtype=torch.uint8)
-            item["label_shape"] = label.shape
-            item["label_affine"] = label_img.affine
-            item["label_positive"] = np.flatnonzero(label)
-        else:
-            item["target"] = torch.as_tensor(sample["target"])
-        return item
 
 
-def fit_transform(transform: ModelTransform, samples: list[dict[str, Any]]) -> None:
+def fit_transform(transform: ModelTransform, images: list[Path]) -> None:
     """Fit the transform's global parameters on the task's raw images, if it has any."""
     if hasattr(transform, "fit"):
-        transform.fit(nib.load(sample["image"]) for sample in samples)
+        transform.fit(nib.load(image) for image in images)
 
 
 def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:

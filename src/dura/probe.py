@@ -1,6 +1,6 @@
 import math
-import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -12,7 +12,7 @@ from sklearn.model_selection import KFold, StratifiedKFold
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
-from dura.data import NiftiDataset, collate, fit_transform
+from dura.data import ImageDataset, LabelDataset, collate, fit_transform
 from dura.models.base import ModelTransform, ModelWrapper
 
 CV_SEED = 0
@@ -30,184 +30,154 @@ LIGHT_MAX_EPOCHS = 150
 LIGHT_PATIENCE = 20
 LIGHT_WARMUP_EPOCHS = 3
 LIGHT_BATCH_SIZE = 32
-# subjects per forward pass, which bounds memory; the gradient is the whole batch's
-LIGHT_MICRO_BATCH = 8
 # fraction of each subject's tokens dropped per training step
 LIGHT_TOKEN_DROP = 0.5
 LIGHT_SEEDS = (0, 1, 2)
 
 
+class Embedder:
+    """
+    The model's dense tokens of a task's images. Keeps the last image set's tokens, so
+    consecutive tasks on the same images embed them once. A transform's fit sees the task's
+    images, so only the same set is reused.
+    """
+
+    def __init__(
+        self,
+        model: ModelWrapper,
+        transform: ModelTransform,
+        batch_size: int = 4,
+        num_workers: int = 8,
+        device: str = "cuda",
+        amp: bool = True,
+    ):
+        self.model = model
+        self.transform = transform
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.device = torch.device(device)
+        self.amp = amp
+        self.images = frozenset()
+        self.embedding = {}
+
+    def __call__(self, samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Each sample's "tokens" of the patches that overlap the mask ([N_i D] bf16, on the cpu),
+        "in_mask" [Gx*Gy*Gz] (cpu), "affine", "grid_shape" and "patch_size"."""
+        images = [sample["image"] for sample in samples]
+        if frozenset(images) != self.images:
+            # free the last set's tokens before embedding the next
+            self.embedding = {}
+            self.embedding = self.embed(images)
+            self.images = frozenset(images)
+        return [self.embedding[image] for image in images]
+
+    def embed(self, paths: list[Path]) -> dict[Path, dict[str, Any]]:
+        """Each image's record."""
+        self.model.eval()
+        fit_transform(self.transform, paths)
+        dataset = ImageDataset(paths, self.transform)
+        loader = DataLoader(
+            dataset, self.batch_size, num_workers=self.num_workers, collate_fn=collate
+        )
+        records = []
+        with (
+            torch.inference_mode(),
+            torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.amp),
+        ):
+            for batch in loader:
+                images = batch["image"].to(self.device)
+                masks = batch["mask"].to(self.device)
+                embedding = self.model.dense_embed(images, masks).float()
+                assert embedding.ndim == 5 and len(embedding) == len(images), (
+                    f"unexpected dense embedding shape {embedding.shape}"
+                )
+                grid_shape = tuple(embedding.shape[1:4])
+                patch_size = patch_size_for(tuple(masks.shape[1:]), grid_shape)
+                in_mask = patchify3d(masks, patch_size).any(dim=2)
+                embedding = embedding.flatten(1, 3)
+                for ii in range(len(images)):
+                    records.append(
+                        {
+                            # bf16 on the cpu: patch 4 tokens of a large cohort don't fit on the gpu
+                            "tokens": embedding[ii, in_mask[ii]].to(torch.bfloat16).cpu(),
+                            "in_mask": in_mask[ii].cpu(),
+                            "affine": batch["affine"][ii],
+                            "grid_shape": grid_shape,
+                            "patch_size": patch_size,
+                        }
+                    )
+        return dict(zip(paths, records))
+
+
 def probe_binary_classification(
-    model: ModelWrapper,
-    transform: ModelTransform,
-    samples: list[dict[str, Any]],
-    n_folds: int = 5,
-    batch_size: int = 8,
-    num_workers: int = 8,
-    device: str = "cuda",
-    amp: bool = True,
+    embedder: Embedder, samples: list[dict[str, Any]], n_folds: int = 5
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     Light attention probe for binary classification. Scores pooled out-of-fold probabilities by
     AUROC with bootstrap CIs.
     """
-    return probe_global(
-        "binary", model, transform, samples, n_folds, batch_size, num_workers, device, amp
-    )
+    return probe_global("binary", embedder, samples, n_folds)
 
 
 def probe_multiclass_classification(
-    model: ModelWrapper,
-    transform: ModelTransform,
-    samples: list[dict[str, Any]],
-    n_folds: int = 5,
-    batch_size: int = 8,
-    num_workers: int = 8,
-    device: str = "cuda",
-    amp: bool = True,
+    embedder: Embedder, samples: list[dict[str, Any]], n_folds: int = 5
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     Light attention probe for labels 0..K-1, scored by macro one-vs-rest AUROC.
     """
-    return probe_global(
-        "multiclass", model, transform, samples, n_folds, batch_size, num_workers, device, amp
-    )
+    return probe_global("multiclass", embedder, samples, n_folds)
 
 
 def probe_regression(
-    model: ModelWrapper,
-    transform: ModelTransform,
-    samples: list[dict[str, Any]],
-    n_folds: int = 5,
-    batch_size: int = 8,
-    num_workers: int = 8,
-    device: str = "cuda",
-    amp: bool = True,
+    embedder: Embedder, samples: list[dict[str, Any]], n_folds: int = 5
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     Light attention probe for regression. Scores pooled out-of-fold predictions by R2 with
     bootstrap CIs.
     """
-    return probe_global(
-        "regression", model, transform, samples, n_folds, batch_size, num_workers, device, amp
-    )
+    return probe_global("regression", embedder, samples, n_folds)
 
 
 def probe_global(
-    kind: str,
-    model: ModelWrapper,
-    transform: ModelTransform,
-    samples: list[dict[str, Any]],
-    n_folds: int,
-    batch_size: int,
-    num_workers: int,
-    device: str,
-    amp: bool,
+    kind: str, embedder: Embedder, samples: list[dict[str, Any]], n_folds: int
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """The light attention probe of the given kind on the model's dense tokens."""
-    tokens, targets, embed_seconds = embed_tokens(
-        model, transform, samples, batch_size, num_workers, device, amp
-    )
-    result = fit_score_light(tokens, targets, kind, n_folds)
-    result["n_params"] = sum(p.numel() for p in model.parameters())
-    result["embed_seconds"] = embed_seconds
+    tokens = [record["tokens"] for record in embedder(samples)]
+    targets = np.array([sample["target"] for sample in samples])
+    result = LightAttention.fit_score(tokens, targets, kind, embedder.device, n_folds)
+    result["n_params"] = sum(p.numel() for p in embedder.model.parameters())
     return result, {}
 
 
-def embed_tokens(
-    model: ModelWrapper,
-    transform: ModelTransform,
-    samples: list[dict[str, Any]],
-    batch_size: int,
-    num_workers: int,
-    device: str,
-    amp: bool,
-) -> tuple[list[Tensor], np.ndarray, float]:
-    """Each subject's dense tokens of the patches that overlap the mask ([N_i D] bf16, on the
-    device), targets [N] and seconds spent embedding."""
-    device_type = torch.device(device).type
-    model.eval()
-    fit_transform(transform, samples)
-    dataset = NiftiDataset(samples, transform)
-    loader = DataLoader(dataset, batch_size, num_workers=num_workers, collate_fn=collate)
-    tokens = []
-    targets = []
-    embed_seconds = 0.0
-    with torch.inference_mode(), torch.autocast(device_type, dtype=torch.bfloat16, enabled=amp):
-        for batch in loader:
-            images = batch["image"].to(device)
-            masks = batch["mask"].to(device)
-            start = time.perf_counter()
-            embedding = model.dense_embed(images, masks).float()
-            if device_type == "cuda":
-                torch.cuda.synchronize()
-            embed_seconds += time.perf_counter() - start
-            assert embedding.ndim == 5 and len(embedding) == len(images), (
-                f"unexpected dense embedding shape {embedding.shape}"
-            )
-            patch_size = patch_size_for(tuple(masks.shape[1:]), tuple(embedding.shape[1:4]))
-            in_mask = patchify3d(masks, patch_size).any(dim=2)
-            embedding = embedding.flatten(1, 3)
-            for ii in range(len(images)):
-                tokens.append(embedding[ii, in_mask[ii]].to(torch.bfloat16))
-            targets.append(batch["target"])
-    return tokens, torch.cat(targets).numpy(), embed_seconds
-
-
-class LightAttention(nn.Module):
-    """
-    Light attention probe: a learned query scores each layer-normed token, a softmax over the
-    tokens weights their average, and a linear head reads it out. No key or value projections:
-    with one query they fold into the query and the head. The prediction splits exactly into
-    per-token terms, so the softmax weights are an attention map.
-    """
-
-    def __init__(self, dim: int, out_dim: int):
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.query = nn.Parameter(torch.randn(1, dim) * dim**-0.5)
-        self.head = nn.Linear(dim, out_dim)
-
-    def forward(self, tokens: Tensor, pad: Tensor) -> Tensor:
-        """tokens [B L D], pad [B L] (True where there is no token) -> [B out_dim]."""
-        tokens = self.norm(tokens)
-        logits = torch.einsum("bld,hd->bhl", tokens, self.query).masked_fill(
-            pad[:, None], -torch.inf
-        )
-        pooled = torch.einsum("bhl,bld->bhd", logits.softmax(-1), tokens)
-        return self.head(pooled.flatten(1))
-
-
 class TokenStore:
-    """All subjects' standardized tokens in one flat [T D] bf16 tensor, so subjects with many
-    tokens (e.g. patch 4) don't pad every subject to the longest one."""
+    """All subjects' standardized and layer-normed tokens in one flat [T D] bf16 tensor on the
+    device, so subjects with many tokens (e.g. patch 4) don't pad every subject to the longest
+    one."""
 
-    def __init__(self, tokens: list[Tensor], train_ids: np.ndarray):
+    def __init__(self, tokens: list[Tensor], train_ids: np.ndarray, device: torch.device):
         # standardized by the train subjects' token mean and std, per channel
-        total = torch.zeros(tokens[0].shape[1], dtype=torch.float64, device=tokens[0].device)
+        total = torch.zeros(tokens[0].shape[1], dtype=torch.float64, device=device)
         total_sq = torch.zeros_like(total)
         count = 0
         for ii in train_ids:
-            t = tokens[ii].double()
+            t = tokens[ii].to(device).double()
             total += t.sum(0)
             total_sq += (t * t).sum(0)
             count += len(t)
         mean = total / count
         std = (total_sq / count - mean**2).clamp_min(1e-12).sqrt().float()
         mean = mean.float()
-        self.lengths = torch.tensor([len(t) for t in tokens], device=tokens[0].device)
+        self.lengths = torch.tensor([len(t) for t in tokens], device=device)
         self.offsets = torch.cat([self.lengths.new_zeros(1), self.lengths.cumsum(0)[:-1]])
+        self.dim = tokens[0].shape[1]
         self.flat = torch.empty(
-            int(self.lengths.sum()),
-            tokens[0].shape[1],
-            dtype=torch.bfloat16,
-            device=tokens[0].device,
+            int(self.lengths.sum()), self.dim, dtype=torch.bfloat16, device=device
         )
         start = 0
         for t in tokens:
-            self.flat[start : start + len(t)] = ((t.float() - mean) / std).bfloat16()
+            t = (t.to(device).float() - mean) / std
+            self.flat[start : start + len(t)] = F.layer_norm(t, (self.dim,)).bfloat16()
             start += len(t)
-        self.dim = self.flat.shape[1]
 
     def batch(self, ids: Tensor, drop: float = 0.0) -> tuple[Tensor, Tensor]:
         """Padded tokens [B L D] and their padding mask [B L], dropping a random drop fraction."""
@@ -223,174 +193,215 @@ class TokenStore:
         return tokens, pad
 
 
-def light_loss(kind: str, y: Tensor, train_ids: np.ndarray) -> Callable[[Tensor, Tensor], Tensor]:
-    """MSE on standardized targets, or class-balanced binary / multiclass cross-entropy (like the
-    logistic probes' class_weight="balanced")."""
-    if kind == "regression":
-        return lambda output, target: F.mse_loss(output.float().squeeze(-1), target)
-    labels = y[torch.as_tensor(train_ids, device=y.device)].long()
-    counts = torch.bincount(labels).float()
-    class_weight = counts.sum() / (len(counts) * counts)
-    if kind == "binary":
-
-        def binary_loss(output: Tensor, target: Tensor) -> Tensor:
-            weight = class_weight[target.long()]
-            loss = F.binary_cross_entropy_with_logits(
-                output.float().squeeze(-1), target, reduction="none"
-            )
-            return (loss * weight).sum() / weight.sum()
-
-        return binary_loss
-    return lambda output, target: F.cross_entropy(
-        output.float(), target.long(), weight=class_weight
-    )
-
-
-def train_light(
-    store: TokenStore,
-    y: Tensor,
-    train_ids: np.ndarray,
-    weight_decay: float,
-    epochs: int,
-    seed: int,
-    kind: str,
-    eval_ids: np.ndarray | None = None,
-) -> tuple[LightAttention, list[float]]:
-    """Train on train_ids; with eval_ids also the eval loss after every epoch, stopping after
-    LIGHT_PATIENCE epochs without improvement (the curve then holds its last value)."""
-    device = store.flat.device
-    torch.manual_seed(seed)
-    out_dim = int(y.max().item()) + 1 if kind == "multiclass" else 1
-    model = LightAttention(store.dim, out_dim).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LIGHT_LR, weight_decay=weight_decay)
-    steps_per_epoch = math.ceil(len(train_ids) / LIGHT_BATCH_SIZE)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lambda step: min(1.0, (step + 1) / (LIGHT_WARMUP_EPOCHS * steps_per_epoch))
-    )
-    loss_fn = light_loss(kind, y, train_ids)
-    generator = torch.Generator().manual_seed(seed)
-    curve = []
-    for _ in range(epochs):
-        stalled = len(curve) > LIGHT_PATIENCE and min(curve[-LIGHT_PATIENCE:]) > min(curve)
-        if eval_ids is not None and stalled:
-            curve += [curve[-1]] * (epochs - len(curve))
-            break
-        model.train()
-        order = train_ids[torch.randperm(len(train_ids), generator=generator).numpy()]
-        for start in range(0, len(order), LIGHT_BATCH_SIZE):
-            ids = torch.as_tensor(order[start : start + LIGHT_BATCH_SIZE], device=device)
-            optimizer.zero_grad(set_to_none=True)
-            for micro in ids.split(LIGHT_MICRO_BATCH):
-                tokens, pad = store.batch(micro, LIGHT_TOKEN_DROP)
-                with torch.autocast(device.type, dtype=torch.bfloat16):
-                    output = model(tokens, pad)
-                loss = loss_fn(output, y[micro]) * len(micro) / len(ids)
-                loss.backward()
-            optimizer.step()
-            scheduler.step()
-        if eval_ids is not None:
-            output = predict_light(model, store, eval_ids)
-            curve.append(loss_fn(output, y[torch.as_tensor(eval_ids, device=device)]).item())
-    return model, curve
-
-
-@torch.no_grad()
-def predict_light(model: LightAttention, store: TokenStore, ids: np.ndarray) -> Tensor:
-    """Raw outputs [N out_dim] for the subjects in ids."""
-    model.eval()
-    device = store.flat.device
-    outputs = []
-    for start in range(0, len(ids), LIGHT_MICRO_BATCH):
-        micro = torch.as_tensor(ids[start : start + LIGHT_MICRO_BATCH], device=device)
-        tokens, pad = store.batch(micro)
-        with torch.autocast(device.type, dtype=torch.bfloat16):
-            outputs.append(model(tokens, pad).float())
-    return torch.cat(outputs)
-
-
-def light_folds(kind: str, n_folds: int) -> KFold | StratifiedKFold:
-    """The probe's folds: stratified for classification."""
-    if kind == "regression":
-        return KFold(n_folds, shuffle=True, random_state=CV_SEED)
-    return StratifiedKFold(n_folds, shuffle=True, random_state=CV_SEED)
-
-
-def fit_score_light(
-    tokens: list[Tensor], targets: np.ndarray, kind: str, n_folds: int = 5
-) -> dict[str, Any]:
+class LightAttention(nn.Module):
     """
-    Light attention probe in n_folds CV: weight decay and epochs by inner CV on each outer train
-    split (seed 0), then refit with each of LIGHT_SEEDS. Scores the seeds' mean out-of-fold
-    prediction with bootstrap CIs.
+    Light attention probe: a learned query scores each layer-normed token, a softmax over the
+    tokens weights their average, and a linear head reads it out. No key or value projections:
+    with one query they fold into the query and the head. The prediction splits exactly into
+    per-token terms, so the softmax weights are an attention map.
+
+    Holds one probe per weight decay, from the same init (seed) and trained on the same batches
+    and token drop, so they share every read of the tokens. The tokens come layer-normed
+    (TokenStore), so only the norm's affine is here.
     """
-    n_samples = len(targets)
-    if kind == "regression":
-        targets = np.asarray(targets, dtype=np.float64)
-        labels = None
-        predictions = np.zeros(n_samples)
-    else:
-        targets = np.asarray(targets).astype(int)
-        n_classes = len(np.unique(targets))
-        assert set(np.unique(targets)) == set(range(n_classes)), "expected labels 0..K-1"
-        assert (n_classes == 2) == (kind == "binary"), f"{n_classes} classes for a {kind} probe"
-        labels = targets
-        predictions = np.zeros(n_samples if kind == "binary" else (n_samples, n_classes))
-    folds = light_folds(kind, n_folds)
-    fold_choices = []
-    start = time.perf_counter()
-    for train_ids, test_ids in folds.split(np.arange(n_samples), labels):
-        store = TokenStore(tokens, train_ids)
-        # regression targets standardized by the train split, so one learning rate fits all tasks
-        mu, sd = (
-            (targets[train_ids].mean(), targets[train_ids].std())
-            if kind == "regression"
-            else (0.0, 1.0)
-        )
-        y = torch.as_tensor((targets - mu) / sd, dtype=torch.float32, device=store.flat.device)
-        inner = light_folds(kind, n_folds)
-        inner_labels = None if labels is None else labels[train_ids]
-        best = (np.inf, None, None)
-        for weight_decay in LIGHT_WEIGHT_DECAYS:
-            curves = [
-                train_light(
-                    store,
-                    y,
-                    train_ids[fit],
-                    weight_decay,
-                    LIGHT_MAX_EPOCHS,
-                    0,
-                    kind,
-                    train_ids[val],
-                )[1]
-                for fit, val in inner.split(train_ids, inner_labels)
-            ]
-            curve = np.mean(curves, axis=0)
-            if curve.min() < best[0]:
-                best = (float(curve.min()), weight_decay, int(curve.argmin()) + 1)
-        inner_loss, weight_decay, epochs = best
-        outputs = []
-        for seed in LIGHT_SEEDS:
-            model, _ = train_light(store, y, train_ids, weight_decay, epochs, seed, kind)
-            outputs.append(predict_light(model, store, test_ids))
-        output = torch.stack(outputs)
-        if kind == "regression":
-            predictions[test_ids] = (output.squeeze(-1).mean(0) * sd + mu).cpu().numpy()
-        elif kind == "binary":
-            predictions[test_ids] = output.squeeze(-1).sigmoid().mean(0).cpu().numpy()
+
+    def __init__(
+        self, dim: int, out_dim: int, kind: str, weight_decays: tuple[float, ...], seed: int
+    ):
+        super().__init__()
+        self.kind = kind
+        self.seed = seed
+        torch.manual_seed(seed)
+        query = torch.randn(dim) * dim**-0.5
+        head = nn.Linear(dim, out_dim)
+        n_probes = len(weight_decays)
+        self.norm_weight = nn.Parameter(torch.ones(n_probes, dim))
+        self.norm_bias = nn.Parameter(torch.zeros(n_probes, dim))
+        self.query = nn.Parameter(query.repeat(n_probes, 1))
+        self.head_weight = nn.Parameter(head.weight.detach().repeat(n_probes, 1, 1))
+        self.head_bias = nn.Parameter(head.bias.detach().repeat(n_probes, 1))
+        self.register_buffer("weight_decays", torch.tensor(weight_decays))
+
+    def forward(self, tokens: Tensor, pad: Tensor) -> Tensor:
+        """Each probe's output [P B out_dim] on layer-normed tokens [B L D], pad [B L] (True
+        where there is no token)."""
+        # the norm's bias adds the same score to every token, which the softmax ignores
+        logits = torch.einsum("bld,pd->pbl", tokens, self.norm_weight * self.query)
+        attention = logits.masked_fill(pad, -torch.inf).softmax(-1)
+        pooled = torch.einsum("pbl,bld->pbd", attention, tokens)
+        pooled = pooled * self.norm_weight[:, None] + self.norm_bias[:, None]
+        return torch.einsum("pbd,pod->pbo", pooled, self.head_weight) + self.head_bias[:, None]
+
+    def loss(self, output: Tensor, target: Tensor) -> Tensor:
+        """Each probe's loss [P]: MSE on standardized targets, or binary / multiclass
+        cross-entropy weighted by class_weight."""
+        output = output.float()
+        if self.kind == "regression":
+            return (output.squeeze(-1) - target).square().mean(-1)
+        target = target.expand(len(output), -1)
+        if self.kind == "binary":
+            loss = F.binary_cross_entropy_with_logits(output.squeeze(-1), target, reduction="none")
         else:
-            predictions[test_ids] = output.softmax(-1).mean(0).cpu().numpy()
-        fold_choices.append(
-            {"weight_decay": weight_decay, "epochs": epochs, "inner_loss": inner_loss}
+            loss = F.cross_entropy(output.transpose(1, 2), target.long(), reduction="none")
+        weight = self.class_weight[target[0].long()]
+        return (loss * weight).sum(-1) / weight.sum()
+
+    def fit(
+        self,
+        store: TokenStore,
+        y: Tensor,
+        train_ids: np.ndarray,
+        epochs: int,
+        eval_ids: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """
+        Train on train_ids. With eval_ids, returns each probe's eval loss after every epoch
+        [P epochs], each probe stopping after LIGHT_PATIENCE epochs without improvement (its
+        curve then holds its last value).
+        """
+        device = store.flat.device
+        if self.kind != "regression":
+            # balanced, like the logistic probes' class_weight="balanced"
+            counts = torch.bincount(y[torch.as_tensor(train_ids, device=device)].long()).float()
+            self.class_weight = counts.sum() / (len(counts) * counts)
+        # AdamW, with each probe's weight decay applied below
+        optimizer = torch.optim.Adam(self.parameters(), lr=LIGHT_LR)
+        steps_per_epoch = math.ceil(len(train_ids) / LIGHT_BATCH_SIZE)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lambda step: min(1.0, (step + 1) / (LIGHT_WARMUP_EPOCHS * steps_per_epoch))
         )
-        del store
-    score = {"binary": score_binary, "multiclass": score_multiclass, "regression": score_regression}
-    return {
-        **score[kind](targets, predictions),
-        "fold_choice": fold_choices,
-        "probe_seconds": time.perf_counter() - start,
-        "n_probe_params": sum(p.numel() for p in model.parameters()),
-        "embed_dim": tokens[0].shape[1],
-    }
+        generator = torch.Generator().manual_seed(self.seed)
+        curves = [[] for _ in self.weight_decays]
+        stopped = [False for _ in self.weight_decays]
+        for _ in range(epochs):
+            if eval_ids is not None:
+                for ii, curve in enumerate(curves):
+                    recent = curve[-LIGHT_PATIENCE:]
+                    stopped[ii] |= len(curve) > LIGHT_PATIENCE and min(recent) > min(curve)
+                if all(stopped):
+                    break
+            self.train()
+            order = train_ids[torch.randperm(len(train_ids), generator=generator).numpy()]
+            for start in range(0, len(order), LIGHT_BATCH_SIZE):
+                ids = torch.as_tensor(order[start : start + LIGHT_BATCH_SIZE], device=device)
+                tokens, pad = store.batch(ids, LIGHT_TOKEN_DROP)
+                with torch.autocast(device.type, dtype=torch.bfloat16):
+                    output = self(tokens, pad)
+                # each probe's loss only reaches its own parameters
+                self.loss(output, y[ids]).sum().backward()
+                with torch.no_grad():
+                    lr = optimizer.param_groups[0]["lr"]
+                    for param in self.parameters():
+                        decay = self.weight_decays.view(-1, *[1] * (param.ndim - 1))
+                        param.mul_(1 - lr * decay)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+            if eval_ids is not None:
+                target = y[torch.as_tensor(eval_ids, device=device)]
+                losses = self.loss(self.predict(store, eval_ids), target).tolist()
+                for curve, done, loss in zip(curves, stopped, losses):
+                    curve.append(curve[-1] if done else loss)
+        return np.array([curve + curve[-1:] * (epochs - len(curve)) for curve in curves])
+
+    @torch.no_grad()
+    def predict(self, store: TokenStore, ids: np.ndarray) -> Tensor:
+        """Each probe's raw outputs [P N out_dim] for the subjects in ids."""
+        self.eval()
+        device = store.flat.device
+        outputs = []
+        for start in range(0, len(ids), LIGHT_BATCH_SIZE):
+            batch = torch.as_tensor(ids[start : start + LIGHT_BATCH_SIZE], device=device)
+            tokens, pad = store.batch(batch)
+            with torch.autocast(device.type, dtype=torch.bfloat16):
+                outputs.append(self(tokens, pad).float())
+        return torch.cat(outputs, dim=1)
+
+    @classmethod
+    def fit_score(
+        cls,
+        tokens: list[Tensor],
+        targets: np.ndarray,
+        kind: str,
+        device: torch.device,
+        n_folds: int = 5,
+    ) -> dict[str, Any]:
+        """
+        Light attention probe in n_folds CV: weight decay and epochs by inner CV on each outer
+        train split (seed 0), then refit with each of LIGHT_SEEDS. Scores the seeds' mean
+        out-of-fold prediction with bootstrap CIs. Tokens [N_i D] per subject, on any device.
+        """
+        n_samples = len(targets)
+        if kind == "regression":
+            targets = np.asarray(targets, dtype=np.float64)
+            labels = None
+            out_dim = 1
+            predictions = np.zeros(n_samples)
+        else:
+            targets = np.asarray(targets).astype(int)
+            n_classes = len(np.unique(targets))
+            assert set(np.unique(targets)) == set(range(n_classes)), "expected labels 0..K-1"
+            assert (n_classes == 2) == (kind == "binary"), f"{n_classes} classes for a {kind} probe"
+            labels = targets
+            out_dim = n_classes if kind == "multiclass" else 1
+            predictions = np.zeros(n_samples if kind == "binary" else (n_samples, n_classes))
+        # stratified for classification
+        make_folds = KFold if kind == "regression" else StratifiedKFold
+        folds = make_folds(n_folds, shuffle=True, random_state=CV_SEED)
+        fold_choices = []
+        for train_ids, test_ids in folds.split(np.arange(n_samples), labels):
+            store = TokenStore(tokens, train_ids, device)
+            # regression targets standardized by the train split, so one learning rate fits all
+            mu, sd = (
+                (targets[train_ids].mean(), targets[train_ids].std())
+                if kind == "regression"
+                else (0.0, 1.0)
+            )
+            y = torch.as_tensor((targets - mu) / sd, dtype=torch.float32, device=device)
+            inner = make_folds(n_folds, shuffle=True, random_state=CV_SEED)
+            inner_labels = None if labels is None else labels[train_ids]
+            # mean inner validation curve [weight decays, epochs]
+            curves = np.mean(
+                [
+                    cls(store.dim, out_dim, kind, LIGHT_WEIGHT_DECAYS, 0)
+                    .to(device)
+                    .fit(store, y, train_ids[fit], LIGHT_MAX_EPOCHS, train_ids[val])
+                    for fit, val in inner.split(train_ids, inner_labels)
+                ],
+                axis=0,
+            )
+            # the first weight decay and epoch with the lowest loss
+            decay_id, epoch_id = np.unravel_index(curves.argmin(), curves.shape)
+            inner_loss = float(curves[decay_id, epoch_id])
+            weight_decay = LIGHT_WEIGHT_DECAYS[decay_id]
+            epochs = int(epoch_id) + 1
+            outputs = []
+            for seed in LIGHT_SEEDS:
+                probe = cls(store.dim, out_dim, kind, (weight_decay,), seed).to(device)
+                probe.fit(store, y, train_ids, epochs)
+                outputs.append(probe.predict(store, test_ids)[0])
+            output = torch.stack(outputs)
+            if kind == "regression":
+                predictions[test_ids] = (output.squeeze(-1).mean(0) * sd + mu).cpu().numpy()
+            elif kind == "binary":
+                predictions[test_ids] = output.squeeze(-1).sigmoid().mean(0).cpu().numpy()
+            else:
+                predictions[test_ids] = output.softmax(-1).mean(0).cpu().numpy()
+            fold_choices.append(
+                {"weight_decay": weight_decay, "epochs": epochs, "inner_loss": inner_loss}
+            )
+            del store
+        score = {
+            "binary": score_binary,
+            "multiclass": score_multiclass,
+            "regression": score_regression,
+        }
+        return {
+            **score[kind](targets, predictions),
+            "fold_choice": fold_choices,
+            "n_probe_params": sum(p.numel() for p in probe.parameters()),
+            "embed_dim": tokens[0].shape[1],
+        }
 
 
 def score_binary(labels: np.ndarray, probabilities: np.ndarray) -> dict[str, Any]:
@@ -473,17 +484,12 @@ def score_regression(targets: np.ndarray, predictions: np.ndarray) -> dict[str, 
 
 
 def probe_binary_segmentation(
-    model: ModelWrapper,
-    transform: ModelTransform,
+    embedder: Embedder,
     samples: list[dict[str, Any]],
     label_fn: Callable[[np.ndarray], np.ndarray],
     n_folds: int = 5,
     n_inner_folds: int = 5,
     max_negative_ratio: float | None = None,
-    batch_size: int = 4,
-    num_workers: int = 8,
-    device: str = "cuda",
-    amp: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     Linear probe for binary segmentation on the dense embedding. Each patch embedding predicts
@@ -493,53 +499,37 @@ def probe_binary_segmentation(
     with bootstrap CIs, so models with different grids are scored on the same voxels. Also
     scores the predicted volumes against the label volumes across subjects (r2, r).
     """
-    device_type = torch.device(device).type
-    model.eval()
-    fit_transform(transform, samples)
-    dataset = NiftiDataset(samples, transform, label_fn)
-    loader = DataLoader(dataset, batch_size, num_workers=num_workers, collate_fn=collate)
-    patch_features = []
+    records = embedder(samples)
+    grids = [
+        (tuple(g * p for g, p in zip(r["grid_shape"], r["patch_size"])), r["affine"])
+        for r in records
+    ]
+    dataset = LabelDataset([sample["label"] for sample in samples], grids, label_fn)
+    loader = DataLoader(
+        dataset, embedder.batch_size, num_workers=embedder.num_workers, collate_fn=collate
+    )
+    # train on the patches that overlap the mask. labels outside it count as missed
+    patch_features = [record["tokens"] for record in records]
+    patch_in_mask = [record["in_mask"] for record in records]
     patch_labels = []
-    patch_in_mask = []
     geometry = []
-    embed_seconds = 0.0
-    with torch.inference_mode(), torch.autocast(device_type, dtype=torch.bfloat16, enabled=amp):
-        for batch in loader:
-            images = batch["image"].to(device)
-            masks = batch["mask"].to(device)
-            labels = batch["target"].to(device)
-            assert labels.max() <= 1, "expected binary labels"
-            start = time.perf_counter()
-            embedding = model.dense_embed(images, masks).float()
-            if device_type == "cuda":
-                torch.cuda.synchronize()
-            embed_seconds += time.perf_counter() - start
-            assert embedding.ndim == 5 and len(embedding) == len(images), (
-                f"unexpected dense embedding shape {embedding.shape}"
+    for batch in loader:
+        labels = batch["target"].to(embedder.device)
+        assert labels.max() <= 1, "expected binary labels"
+        for ii, label in enumerate(labels):
+            record = records[len(geometry)]
+            label_patches = patchify3d(label[None], record["patch_size"])[0]
+            patch_labels.append(label_patches[record["in_mask"].to(embedder.device)])
+            geometry.append(
+                {
+                    "affine": record["affine"],
+                    "grid_shape": record["grid_shape"],
+                    "patch_size": record["patch_size"],
+                    "label_shape": batch["label_shape"][ii],
+                    "label_affine": batch["label_affine"][ii],
+                    "label_positive": batch["label_positive"][ii],
+                }
             )
-            grid_shape = tuple(embedding.shape[1:4])
-            patch_size = patch_size_for(tuple(masks.shape[1:]), grid_shape)
-
-            embedding = embedding.flatten(1, 3)
-            mask_patches = patchify3d(masks, patch_size)
-            label_patches = patchify3d(labels, patch_size)
-            # train on the patches that overlap the mask. labels outside it count as missed
-            for ii in range(len(images)):
-                in_mask = mask_patches[ii].any(dim=1)
-                patch_in_mask.append(in_mask.cpu())
-                # bf16 on the cpu: patch 4 features of a large cohort don't fit on the gpu
-                patch_features.append(embedding[ii, in_mask].to(torch.bfloat16).cpu())
-                patch_labels.append(label_patches[ii, in_mask])
-                geometry.append(
-                    {
-                        "affine": batch["affine"][ii],
-                        "grid_shape": grid_shape,
-                        "patch_size": patch_size,
-                        "label_shape": batch["label_shape"][ii],
-                        "label_affine": batch["label_affine"][ii],
-                        "label_positive": batch["label_positive"][ii],
-                    }
-                )
     embed_dim = patch_features[0].shape[1]
 
     n_subjects = len(patch_features)
@@ -559,18 +549,17 @@ def probe_binary_segmentation(
         inner_dice = torch.zeros(len(SEGMENTATION_ALPHAS), n_subjects, n_thresholds)
         inner_folds = KFold(n_inner_folds, shuffle=True, random_state=CV_SEED)
         for inner_train, inner_val in inner_folds.split(train_ids):
-            inner_train_ids = train_ids[inner_train]
             inner_val_ids = train_ids[inner_val]
-            for alpha_id, alpha in enumerate(SEGMENTATION_ALPHAS):
-                probabilities = fit_predict_segmentation(
-                    patch_features,
-                    patch_labels,
-                    inner_train_ids,
-                    inner_val_ids,
-                    alpha,
-                    max_negative_ratio,
-                )
-                for ii, subject_probabilities in zip(inner_val_ids, probabilities):
+            probabilities = fit_predict_segmentation(
+                patch_features,
+                patch_labels,
+                train_ids[inner_train],
+                inner_val_ids,
+                SEGMENTATION_ALPHAS,
+                max_negative_ratio,
+            )
+            for alpha_id, alpha_probabilities in enumerate(probabilities):
+                for ii, subject_probabilities in zip(inner_val_ids, alpha_probabilities):
                     inner_dice[alpha_id, ii] = dice_by_threshold(
                         subject_probabilities, patch_labels[ii]
                     )
@@ -584,8 +573,8 @@ def probe_binary_segmentation(
         fold_alphas.append(alpha)
         fold_thresholds.append(threshold.item())
 
-        probabilities = fit_predict_segmentation(
-            patch_features, patch_labels, train_ids, test_ids, alpha, max_negative_ratio
+        (probabilities,) = fit_predict_segmentation(
+            patch_features, patch_labels, train_ids, test_ids, (alpha,), max_negative_ratio
         )
         for ii, subject_probabilities in zip(test_ids, probabilities):
             subject_probabilities_out_of_fold[ii] = subject_probabilities.cpu()
@@ -638,8 +627,7 @@ def probe_binary_segmentation(
         "subject_label_volume_ml": subject_label_volume.tolist(),
         "n_samples": n_subjects,
         "embed_dim": embed_dim,
-        "n_params": sum(p.numel() for p in model.parameters()),
-        "embed_seconds": embed_seconds,
+        "n_params": sum(p.numel() for p in embedder.model.parameters()),
     }
     state = {
         "in_mask": patch_in_mask,
@@ -655,29 +643,34 @@ def fit_predict_segmentation(
     patch_labels: list[Tensor],
     train_ids: np.ndarray,
     test_ids: np.ndarray,
-    alpha: float,
+    alphas: tuple[float, ...],
     max_negative_ratio: float | None = None,
-) -> list[Tensor]:
-    """Fit on the train subjects' patches, return per-patch probabilities for each test subject."""
+) -> list[list[Tensor]]:
+    """Fit on the train subjects' patches with each penalty in alphas, return per-patch
+    probabilities for each penalty and test subject."""
     device = patch_labels[train_ids[0]].device
     train_labels = torch.cat([patch_labels[ii] for ii in train_ids])
     keep = torch.ones(len(train_labels), dtype=torch.bool, device=device)
     if max_negative_ratio is not None:
         keep = subsample_negatives(train_labels, max_negative_ratio)
-    # only each subject's kept rows go to the device, as float32
-    keeps = keep.cpu().split([len(patch_labels[ii]) for ii in train_ids])
-    train_features = torch.cat([patch_features[ii][k] for ii, k in zip(train_ids, keeps)])
-    train_features = train_features.float().to(device)
     train_labels = train_labels[keep]
+    # each subject's kept rows, as float32 on the device
+    train_features = torch.empty(len(train_labels), patch_features[0].shape[1], device=device)
+    start = 0
+    for ii, k in zip(train_ids, keep.split([len(patch_labels[ii]) for ii in train_ids])):
+        rows = patch_features[ii].to(device)[k]
+        train_features[start : start + len(rows)] = rows
+        start += len(rows)
     mean = train_features.mean(dim=0)
     std = train_features.std(dim=0, correction=0).clamp_min(1e-6)
-    # in place: train_features is a copy
-    coef, intercept = fit_logistic(train_features.sub_(mean).div_(std), train_labels, alpha)
+    train_features.sub_(mean).div_(std)
+    fits = [fit_logistic(train_features, train_labels, alpha) for alpha in alphas]
 
-    probabilities = []
+    probabilities = [[] for _ in alphas]
     for ii in test_ids:
-        logits = (patch_features[ii].to(device).float() - mean) / std @ coef + intercept
-        probabilities.append(torch.sigmoid(logits))
+        features = (patch_features[ii].to(device).float() - mean) / std
+        for alpha_probabilities, (coef, intercept) in zip(probabilities, fits):
+            alpha_probabilities.append(torch.sigmoid(features @ coef + intercept))
     return probabilities
 
 

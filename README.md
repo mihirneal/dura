@@ -20,7 +20,9 @@ uv run python -m dura.run <model> <output_dir> --model-kwargs ckpt_path=/path/to
 
 Each task writes `<output_dir>/<task>.json`, and tasks that already have a result are skipped. `--tasks` runs a subset, and `--help` lists the registered models and tasks.
 
-The global tasks (classification and regression) use a light attention probe in 5-fold CV. It pools the model's last-layer patch tokens with one learned query (a softmax over the tokens, then a linear head), so it can weight the regions that matter, and its weights are a per-subject attention map. Its weight decay and epochs are picked by inner CV, and it is refit with three seeds. It needs a GPU, and keeps every subject's tokens on it (~20 GB for 500 subjects at patch 4). Segmentation uses a linear probe on each patch token.
+Tasks on the same images (the two UCSF-BMSR T1c tasks, ADNI diagnosis and the five anatomy tasks) are listed together, and run one after another in one call they embed the images once.
+
+The global tasks (classification and regression) use a light attention probe in 5-fold CV. It pools the model's last-layer patch tokens with one learned query (a softmax over the tokens, then a linear head), so it can weight the regions that matter, and its weights are a per-subject attention map. Its weight decay and epochs are picked by inner CV, and it is refit with three seeds. It needs a GPU, and keeps every subject's tokens on it (~25 GB for 500 subjects at patch 4). Segmentation uses a linear probe on each patch token.
 
 | Model | Extra | Kwargs |
 |---|---|---|
