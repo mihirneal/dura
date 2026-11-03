@@ -153,6 +153,24 @@ def microbleeds_segmentation() -> Probe:
     )
 
 
+def vs_segmentation() -> Probe:
+    """Vestibular schwannoma on contrast T1, one scan per person from crossMoDA and VS-MC-RC2."""
+    root = DATA_ROOT / "vestibular_schwannoma"
+    with (root / "vs_segmentation.tsv").open() as f:
+        rows = list(csv.DictReader(f, delimiter="\t"))
+    assert rows, f"no subjects in {root / 'vs_segmentation.tsv'}"
+    samples = [
+        {"subject": row["subject"], "image": root / row["image"], "label": root / row["label"]}
+        for row in rows
+    ]
+    return partial(
+        probe_binary_segmentation,
+        samples=samples,
+        label_fn=partial(select_labels, label_ids=(1,)),
+        max_negative_ratio=MAX_NEGATIVE_RATIO,
+    )
+
+
 def adni_samples(task: str, target_type: type = float) -> list[dict[str, Any]]:
     """One subject per row of DATA_ROOT/adni/<task>.tsv: its image and label, relative to
     DATA_ROOT/adni, or its target."""
@@ -229,6 +247,7 @@ TASKS: dict[str, Callable[[], Probe]] = {
         ms_flair_lesions,
         stroke_dwi_infarct,
         microbleeds_segmentation,
+        vs_segmentation,
         adni_diagnosis,
         adni_hippocampus,
         adni_amygdala,
@@ -248,6 +267,7 @@ HEADLINE_METRICS: dict[str, str] = {
     "ms_flair_lesions": "dice",
     "stroke_dwi_infarct": "dice",
     "microbleeds_segmentation": "dice",
+    "vs_segmentation": "dice",
     # macro one-vs-rest
     "adni_diagnosis": "auroc",
     "adni_hippocampus": "dice",
