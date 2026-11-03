@@ -9,6 +9,8 @@ import dura.probe
 from dura.models.base import ModelTransform, ModelWrapper
 from dura.probe import (
     Embedder,
+    lesion_detection,
+    lesion_scores,
     patchify3d,
     probe_binary_classification,
     probe_binary_segmentation,
@@ -197,3 +199,28 @@ def test_embedder_reuses_tokens(samples):
     again = embedder(with_target(samples[::-1], "age"))
     assert all(a is b for a, b in zip(again, first[::-1]))
     assert embedder(with_target(samples[:10], "class"))[0] is not first[0]
+
+
+def test_lesion_detection():
+    labels = np.zeros((20, 20, 20), dtype=bool)
+    labels[2:4, 2:4, 2:4] = True  # detected, 8 voxels
+    labels[10:12, 10:12, 10:12] = True  # missed
+    labels[15, 15, 15] = True  # detected, 1 voxel
+    predicted = np.zeros_like(labels)
+    predicted[3:6, 3:6, 3:6] = True  # overlaps the first lesion
+    predicted[15:17, 15:17, 15:17] = True  # overlaps the third
+    predicted[0, 18, 18] = True  # false positive
+    lesions = lesion_detection(predicted, labels, voxel_ml=0.01)
+    assert lesions["n_label"] == 3 and lesions["n_predicted"] == 3
+    assert lesions["n_predicted_true"] == 2
+    assert lesions["detected"].tolist() == [True, False, True]
+    assert np.allclose(lesions["label_ml"], [0.08, 0.08, 0.01])
+
+    scores = lesion_scores([lesions, lesion_detection(np.zeros_like(labels), labels, 0.01)])
+    # subject 1: sensitivity 2/3, precision 2/3; subject 2 predicts nothing
+    assert np.allclose(scores["subject_lesion_f1"], [2 / 3, 0])
+    assert np.isclose(scores["lesion_sensitivity"], 2 / 6)
+    assert np.isclose(scores["lesion_precision"], 2 / 3)
+    assert np.isclose(scores["false_positive_lesions_per_scan"], 0.5)
+    assert scores["lesion_sensitivity_by_ml"]["0.0-0.03"] == [0.5, 2]
+    assert scores["lesion_sensitivity_by_ml"]["0.03-0.5"] == [0.25, 4]

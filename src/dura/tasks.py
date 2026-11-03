@@ -46,17 +46,19 @@ def ucsf_bmsr_samples(modality: str) -> list[dict[str, Any]]:
     ]
 
 
-def ucsf_bmsr_label(modality: str, label_id: int) -> Probe:
+def ucsf_bmsr_label(modality: str, label_id: int, lesion_metrics: bool = False) -> Probe:
     return partial(
         probe_binary_segmentation,
         samples=ucsf_bmsr_samples(modality),
         label_fn=partial(select_labels, label_ids=(label_id,)),
         max_negative_ratio=MAX_NEGATIVE_RATIO,
+        lesion_metrics=lesion_metrics,
     )
 
 
 def ucsf_bmsr_t1c_enhancing() -> Probe:
-    return ucsf_bmsr_label("t1c", UCSF_ENHANCING)
+    # metastases are often many and small, so also score them lesion-wise
+    return ucsf_bmsr_label("t1c", UCSF_ENHANCING, lesion_metrics=True)
 
 
 def ucsf_bmsr_t1c_edema() -> Probe:

@@ -39,11 +39,11 @@ Brain masks live in `DURA_DATA_ROOT/brain_masks/<image path relative to DURA_DAT
 
 | Dataset | Tasks | Metric |
 |---|---|---|
-| ucsf_bmsr | `ucsf_bmsr_t1c_enhancing`, `ucsf_bmsr_t1c_edema`, `ucsf_bmsr_flair_edema` | dice |
+| ucsf_bmsr | `ucsf_bmsr_t1c_enhancing`, `ucsf_bmsr_t1c_edema`, `ucsf_bmsr_flair_edema` | dice; lesion F1 on enhancing |
 | ms | `ms_flair_lesions` | dice, lesion F1 |
 | adni | `adni_diagnosis`, `adni_mci_conversion`, `adni_wmh_flair`, `adni_wmh_t1`, `adni_hippocampus`, `adni_amygdala`, `adni_temporal_horns`, `adni_lateral_ventricles`, `adni_cortex` | AUROC, R², dice |
 
-**ucsf_bmsr**: [UCSF-BMSR](https://imagingdatasets.ucsf.edu/dataset/1) v1.3 ([Rudie et al. 2024](https://doi.org/10.1148/ryai.230126)), brain metastasis segmentation. 199 visits, one per patient, with T1post, FLAIR and the BraTS-METS 2023 labels. Each task segments one label: enhancing tumor on T1c, and edema on T1c and on FLAIR.
+**ucsf_bmsr**: [UCSF-BMSR](https://imagingdatasets.ucsf.edu/dataset/1) v1.3 ([Rudie et al. 2024](https://doi.org/10.1148/ryai.230126)), brain metastasis segmentation. 199 visits, one per patient, with T1post, FLAIR and the BraTS-METS 2023 labels. Each task segments one label: enhancing tumor on T1c, and edema on T1c and on FLAIR. Enhancing tumor is also scored lesion-wise like `ms_flair_lesions`, since the number of metastases matters and small ones barely move dice.
 
 ```bash
 uv run python datasets/ucsf_bmsr/make_manifest.py /data/smri-datasets/UCSF-BMSR   # freeze the subjects
