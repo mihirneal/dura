@@ -42,6 +42,7 @@ Brain masks live in `DURA_DATA_ROOT/brain_masks/<image path relative to DURA_DAT
 | ucsf_bmsr | `ucsf_bmsr_t1c_enhancing`, `ucsf_bmsr_t1c_edema`, `ucsf_bmsr_flair_edema` | dice; lesion F1 on enhancing |
 | ms | `ms_flair_lesions` | dice, lesion F1 |
 | stroke | `stroke_dwi_infarct` | dice, lesion F1 |
+| microbleeds | `microbleeds_segmentation` | dice, lesion F1 |
 | adni | `adni_diagnosis`, `adni_mci_conversion`, `adni_wmh_flair`, `adni_wmh_t1`, `adni_hippocampus`, `adni_amygdala`, `adni_temporal_horns`, `adni_lateral_ventricles`, `adni_cortex` | AUROC, R², dice |
 
 **ucsf_bmsr**: [UCSF-BMSR](https://imagingdatasets.ucsf.edu/dataset/1) v1.3 ([Rudie et al. 2024](https://doi.org/10.1148/ryai.230126)), brain metastasis segmentation. 199 visits, one per patient, with T1post, FLAIR and the BraTS-METS 2023 labels. Each task segments one label: enhancing tumor on T1c, and edema on T1c and on FLAIR. Enhancing tumor is also scored lesion-wise like `ms_flair_lesions`, since the number of metastases matters and small ones barely move dice.
@@ -86,6 +87,28 @@ The SOOP patients are [soop_manifest.txt](datasets/stroke/soop_manifest.txt): 25
 uv run python datasets/stroke/make_dataset.py $DURA_DATA_ROOT/stroke \
     --isles /data/smri-datasets/ISLES-2022 --soop /data/connor/brain_datasets/datasets/soop/source
 uv run python datasets/stroke/make_brain_masks.py   # SynthStrip 1.8, CPU; --shard i/n per slurm job
+**microbleeds**: cerebral microbleeds, the small dark dots on T2*-weighted scans left by small vessel disease and cerebral amyloid angiopathy, one scan per person, 300 scans with microbleeds. Most are a few mm across, below one 4 mm patch.
+
+| Source | People | Scan | Labels |
+|---|---|---|---|
+| [VALDO 2021](https://valdo.grand-challenge.org) Task 2 | 50 (236 microbleeds) | T2* gradient echo, skull stripped; 3 sites: 0.45 × 0.45 × 4 mm, 0.49 × 0.49 × 0.8 mm, 1 × 1 × 3-4 mm | microbleed masks |
+| [AIBL microbleeds](https://data.csiro.au/collection/csiro:50304) (CSIRO collection 50304) | 30 (65) | SWI, 0.94 × 0.94 × 1.75 mm | one voxel per definite microbleed |
+| [ADNI](https://adni.loni.usc.edu) GRE, ADNIGO to ADNI3 | 220 of the 395 with microbleeds, sampled with a fixed seed (1,677) | 2D axial T2* GRE, ~0.8 × 0.8 × 4 mm, 3T | Mayo Clinic reads (`MAYOADIRL_MRI_MCH`): a world coordinate per definite microbleed |
+
+- `microbleeds_segmentation` segments the microbleeds, with all sources pooled, and reports dice and the lesion-wise scores of `ms_flair_lesions`.
+- An AIBL or ADNI point is drawn as a 1.5 mm ball (a 3 × 3 voxel cross-section), so a prediction counts if it reaches the dot's voxel or its neighbours: the points sit within a voxel of the darkest voxel of the dot (AIBL 1-based voxel indices; ADNI RAS world coordinates, which land on the dots in the dcm2niix affine). Only definite microbleeds are labelled.
+- ADNI: each subject's first scan that Mayo read and that IDA still serves (24 of the 6,662 read scans are missing). A 3-echo acquisition is one series per echo in IDA; the read series is used.
+- AIBL people are scanned at several visits, and 12 of the 30 also have visits without microbleeds: each keeps their first visit with them.
+- Brain masks are [SynthStrip](https://synthstrip.io) 1.8 on each scan (`mri_synthstrip` from FreeSurfer or the `freesurfer/synthstrip:1.8` image, on CPU), cut to the scan's nonzero voxels with their holes filled (the darkest microbleed cores are 0 in some VALDO scans).
+
+```bash
+uv run --with dcm2niix==1.0.20250506 python datasets/microbleeds/convert_adni_gre.py \
+    /data/mihir-stuff/adni_gre/archive/ADNI_T2Star.zip /data/mihir-stuff/adni_gre/nifti   # IDA download of the read scans
+uv run --with openpyxl --with pyreadr python datasets/microbleeds/make_dataset.py $DURA_DATA_ROOT/microbleeds \
+    --valdo /data/mihir-stuff/valdo2021/Task2 --aibl /data/mihir-stuff/aibl_cmb_csiro/PublicDataShare_2020 \
+    --adni-nifti /data/mihir-stuff/adni_gre/nifti \
+    --adni-reads /data/smri-datasets/ADNI/metadata/Tables_18Jun2026/ADNIMERGE2/data/MAYOADIRL_MRI_MCH.rda
+uv run python datasets/microbleeds/make_brain_masks.py   # SynthStrip on CPU, mri_synthstrip on PATH
 ```
 
 **adni**: [ADNI](https://adni.loni.usc.edu) 3T scans from ADNIGO to ADNI4, converted from the DICOMs with dcm2niix, with labels from the ADNIMERGE2 tables of the 18 Jun 2026 download. ADNI1 is left out: it is mostly 1.5T and has no FLAIR. Each task has its own 500 subjects with one scan each, except the five anatomy tasks, which segment the diagnosis subjects: 1,225 subjects in all. ADNI's diagnosis comes from the same cognitive tests a clinician already has, so it is only a sanity check. The other tasks are things MRI itself shows: prognosis, small vessel disease and atrophy of the regions that separate Alzheimer's disease from normal aging.

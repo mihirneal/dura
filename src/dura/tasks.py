@@ -1,4 +1,5 @@
 import csv
+import json
 from collections.abc import Callable
 from functools import partial
 from typing import Any
@@ -24,6 +25,8 @@ SYNTHSEG_INFERIOR_LATERAL_VENTRICLES = (5, 44)
 SYNTHSEG_LATERAL_VENTRICLES = (4, 43)
 SYNTHSEG_CORTEX = (3, 42)
 MAX_NEGATIVE_RATIO = 10.0
+# the scan of each microbleeds source: T2* gradient echo or susceptibility weighted
+MICROBLEED_SCANS = {"valdo": "t2s", "aibl": "swi", "adni": "t2s"}
 
 
 def select_labels(label: np.ndarray, label_ids: tuple[int, ...]) -> np.ndarray:
@@ -119,6 +122,37 @@ def stroke_dwi_infarct() -> Probe:
     )
 
 
+def microbleeds_samples() -> list[dict[str, Any]]:
+    """One scan per person, sub-<source><id>/<scan>.nii.gz, with its microbleed mask on the same
+    grid."""
+    root = DATA_ROOT / "microbleeds"
+    subjects = sorted((root / "images").glob("sub-*"))
+    assert subjects, f"no subjects in {root / 'images'}"
+    samples = []
+    for sub in subjects:
+        labels = root / "labels" / sub.name
+        info = json.loads((labels / "labels.json").read_text())
+        samples.append(
+            {
+                "subject": sub.name.removeprefix("sub-"),
+                "image": sub / f"{MICROBLEED_SCANS[info['source']]}.nii.gz",
+                "label": labels / "microbleeds.nii.gz",
+            }
+        )
+    return samples
+
+
+def microbleeds_segmentation() -> Probe:
+    """Segmentation of the microbleeds, all sources pooled, also scored lesion-wise."""
+    return partial(
+        probe_binary_segmentation,
+        samples=microbleeds_samples(),
+        label_fn=partial(select_labels, label_ids=(1,)),
+        max_negative_ratio=MAX_NEGATIVE_RATIO,
+        lesion_metrics=True,
+    )
+
+
 def adni_samples(task: str, target_type: type = float) -> list[dict[str, Any]]:
     """One subject per row of DATA_ROOT/adni/<task>.tsv: its image and label, relative to
     DATA_ROOT/adni, or its target."""
@@ -194,6 +228,7 @@ TASKS: dict[str, Callable[[], Probe]] = {
         ucsf_bmsr_flair_edema,
         ms_flair_lesions,
         stroke_dwi_infarct,
+        microbleeds_segmentation,
         adni_diagnosis,
         adni_hippocampus,
         adni_amygdala,
@@ -212,6 +247,7 @@ HEADLINE_METRICS: dict[str, str] = {
     "ucsf_bmsr_flair_edema": "dice",
     "ms_flair_lesions": "dice",
     "stroke_dwi_infarct": "dice",
+    "microbleeds_segmentation": "dice",
     # macro one-vs-rest
     "adni_diagnosis": "auroc",
     "adni_hippocampus": "dice",
