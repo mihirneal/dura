@@ -1,3 +1,4 @@
+import itertools
 import math
 from collections.abc import Callable
 from pathlib import Path
@@ -7,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+from scipy import ndimage
 from sklearn.metrics import balanced_accuracy_score, mean_absolute_error, r2_score, roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold
 from torch import Tensor, nn
@@ -19,6 +21,8 @@ CV_SEED = 0
 N_BOOTSTRAP = 1000
 SEGMENTATION_ALPHAS = (1e1, 1e2, 1e3, 1e4, 1e5)
 SEGMENTATION_THRESHOLDS = torch.logspace(-3, -0.1, 30)
+# lesion-wise sensitivity bins, mL: below about 4 mm across, up to about 10 mm, larger
+LESION_SIZE_BINS_ML = (0.0, 0.03, 0.5, np.inf)
 # rows per chunk of the logistic loss, so large training sets fit in memory
 LOGISTIC_CHUNK = 2**18
 # light attention probe (the global tasks): one learned query pools the model's dense tokens.
@@ -490,6 +494,7 @@ def probe_binary_segmentation(
     n_folds: int = 5,
     n_inner_folds: int = 5,
     max_negative_ratio: float | None = None,
+    lesion_metrics: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """
     Linear probe for binary segmentation on the dense embedding. Each patch embedding predicts
@@ -498,6 +503,8 @@ def probe_binary_segmentation(
     label's native grid, where per-subject dice, average precision and voxel auroc are scored
     with bootstrap CIs, so models with different grids are scored on the same voxels. Also
     scores the predicted volumes against the label volumes across subjects (r2, r).
+
+    lesion_metrics adds lesion-wise detection at the same threshold (see lesion_scores).
     """
     records = embedder(samples)
     grids = [
@@ -542,6 +549,7 @@ def probe_binary_segmentation(
     subject_label_volume = np.zeros(n_subjects)
     subject_probabilities_out_of_fold = [None] * n_subjects
     subject_fold = np.zeros(n_subjects, dtype=int)
+    subject_lesions = [None] * n_subjects
     fold_alphas = []
     fold_thresholds = []
     folds = KFold(n_folds, shuffle=True, random_state=CV_SEED)
@@ -594,6 +602,16 @@ def probe_binary_segmentation(
             n_predicted = (native_probabilities >= threshold.to(native_probabilities.device)).sum()
             subject_volume[ii] = n_predicted.item() * voxel_ml
             subject_label_volume[ii] = native_labels.sum().item() * voxel_ml
+            if lesion_metrics:
+                full_probabilities, _, full_labels = to_native_full(
+                    subject_probabilities, patch_in_mask[ii], geometry[ii]
+                )
+                shape = geometry[ii]["label_shape"]
+                subject_lesions[ii] = lesion_detection(
+                    (full_probabilities >= threshold.item()).cpu().numpy().reshape(shape),
+                    full_labels.cpu().numpy().reshape(shape),
+                    voxel_ml,
+                )
 
     rng = np.random.default_rng(0)
     bootstrap_dice = []
@@ -625,6 +643,7 @@ def probe_binary_segmentation(
         "subject_voxel_auroc": subject_voxel_auroc.tolist(),
         "subject_volume_ml": subject_volume.tolist(),
         "subject_label_volume_ml": subject_label_volume.tolist(),
+        **(lesion_scores(subject_lesions) if lesion_metrics else {}),
         "n_samples": n_subjects,
         "embed_dim": embed_dim,
         "n_params": sum(p.numel() for p in embedder.model.parameters()),
@@ -707,6 +726,16 @@ def to_native(
     trilinear. Returns the probabilities and labels of the native voxels covered by a scored
     patch, plus every positive voxel: positives the model cropped or masked out score 0.
     """
+    probabilities, covered, labels = to_native_full(probabilities, in_mask, geometry)
+    keep = covered | labels
+    return probabilities[keep], labels[keep]
+
+
+def to_native_full(
+    probabilities: Tensor, in_mask: Tensor, geometry: dict[str, Any]
+) -> tuple[Tensor, Tensor, Tensor]:
+    """to_native on every native voxel, flat: probabilities (0 where no scored patch reaches),
+    whether a scored patch covers the voxel, and the labels."""
     device = probabilities.device
     grid_shape, patch_size = geometry["grid_shape"], geometry["patch_size"]
     patches = probabilities.new_zeros(math.prod(grid_shape), math.prod(patch_size), 2)
@@ -735,8 +764,68 @@ def to_native(
 
     labels = torch.zeros(len(ijk), dtype=torch.bool, device=device)
     labels[torch.as_tensor(geometry["label_positive"], device=device)] = True
-    keep = (native[1] > 0) | labels
-    return native[0, keep], labels[keep]
+    return native[0], native[1] > 0, labels
+
+
+def lesion_detection(predicted: np.ndarray, labels: np.ndarray, voxel_ml: float) -> dict[str, Any]:
+    """Lesion-wise counts on the native grid: lesions are 26-connected components, and one is
+    detected (or a predicted one true) when it overlaps the other mask by at least a voxel."""
+    structure = np.ones((3, 3, 3), dtype=bool)
+    label_components, n_label = ndimage.label(labels, structure)
+    predicted_components, n_predicted = ndimage.label(predicted, structure)
+    overlap = predicted & labels
+    detected = np.zeros(n_label + 1, dtype=bool)
+    detected[np.unique(label_components[overlap])] = True
+    return {
+        "n_label": n_label,
+        "n_predicted": n_predicted,
+        "n_predicted_true": len(np.unique(predicted_components[overlap])),
+        "label_ml": np.bincount(label_components.ravel(), minlength=n_label + 1)[1:] * voxel_ml,
+        "detected": detected[1:],
+    }
+
+
+def lesion_scores(lesions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Lesion-wise F1 per subject (a subject with no predicted lesion scores 0), pooled
+    sensitivity overall and by lesion size, pooled precision and false positive lesions per scan."""
+    n_label = np.array([s["n_label"] for s in lesions])
+    n_predicted = np.array([s["n_predicted"] for s in lesions])
+    n_true = np.array([s["n_predicted_true"] for s in lesions])
+    n_detected = np.array([s["detected"].sum() for s in lesions])
+    sensitivity = np.divide(
+        n_detected, n_label, out=np.full(len(lesions), np.nan), where=n_label > 0
+    )
+    precision = np.divide(n_true, n_predicted, out=np.zeros(len(lesions)), where=n_predicted > 0)
+    total = sensitivity + precision
+    f1 = np.divide(2 * sensitivity * precision, total, out=np.zeros(len(lesions)), where=total > 0)
+    f1[n_label == 0] = np.nan
+    label_ml = np.concatenate([s["label_ml"] for s in lesions])
+    detected = np.concatenate([s["detected"] for s in lesions])
+    by_size = {}
+    for low, high in itertools.pairwise(LESION_SIZE_BINS_ML):
+        in_bin = (label_ml >= low) & (label_ml < high)
+        by_size[f"{low}-{high}"] = [
+            float(detected[in_bin].mean()) if in_bin.any() else None,
+            int(in_bin.sum()),
+        ]
+    rng = np.random.default_rng(0)
+    bootstrap_f1 = [np.nanmean(f1[rng.integers(0, len(f1), len(f1))]) for _ in range(N_BOOTSTRAP)]
+    return {
+        "lesion_f1": np.nanmean(f1),
+        "lesion_f1_ci": np.nanpercentile(bootstrap_f1, [2.5, 97.5]).tolist(),
+        "lesion_sensitivity": n_detected.sum() / max(n_label.sum(), 1),
+        "lesion_precision": n_true.sum() / max(n_predicted.sum(), 1),
+        "false_positive_lesions_per_scan": (n_predicted - n_true).mean(),
+        # [sensitivity, number of label lesions] per size bin in mL
+        "lesion_sensitivity_by_ml": by_size,
+        "lesion_count_r": np.corrcoef(n_label, n_predicted)[0, 1]
+        if n_predicted.std() > 0
+        else np.nan,
+        "subject_lesion_f1": f1.tolist(),
+        "subject_n_lesions": n_label.tolist(),
+        "subject_n_predicted_lesions": n_predicted.tolist(),
+        "subject_n_false_positive_lesions": (n_predicted - n_true).tolist(),
+    }
 
 
 def voxel_auroc(probabilities: Tensor, labels: Tensor) -> float:

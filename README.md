@@ -40,6 +40,7 @@ Brain masks live in `DURA_DATA_ROOT/brain_masks/<image path relative to DURA_DAT
 | Dataset | Tasks | Metric |
 |---|---|---|
 | ucsf_bmsr | `ucsf_bmsr_t1c_enhancing`, `ucsf_bmsr_t1c_edema`, `ucsf_bmsr_flair_edema` | dice |
+| ms | `ms_flair_lesions` | dice, lesion F1 |
 | adni | `adni_diagnosis`, `adni_mci_conversion`, `adni_wmh_flair`, `adni_wmh_t1`, `adni_hippocampus`, `adni_amygdala`, `adni_temporal_horns`, `adni_lateral_ventricles`, `adni_cortex` | AUROC, R², dice |
 
 **ucsf_bmsr**: [UCSF-BMSR](https://imagingdatasets.ucsf.edu/dataset/1) v1.3 ([Rudie et al. 2024](https://doi.org/10.1148/ryai.230126)), brain metastasis segmentation. 199 visits, one per patient, with T1post, FLAIR and the BraTS-METS 2023 labels. Each task segments one label: enhancing tumor on T1c, and edema on T1c and on FLAIR.
@@ -47,6 +48,26 @@ Brain masks live in `DURA_DATA_ROOT/brain_masks/<image path relative to DURA_DAT
 ```bash
 uv run python datasets/ucsf_bmsr/make_manifest.py /data/smri-datasets/UCSF-BMSR   # freeze the subjects
 uv run python datasets/ucsf_bmsr/make_dataset.py /data/smri-datasets/UCSF-BMSR $DURA_DATA_ROOT/ucsf_bmsr
+```
+
+**ms**: multiple sclerosis white matter lesions on FLAIR, 200 patients with one scan each, pooled from three releases. Every patient has MS, so there are no healthy controls.
+
+| Source | Patients | FLAIR | Labels |
+|---|---|---|---|
+| [MS3SEG](https://huggingface.co/Bawil/MS3SEG) | 100 | 2D axial, 0.9 mm in-plane, ~7 mm between slices; one center, 1.5T Toshiba Vantage Elan | expert lesion mask |
+| [3D-MR-MS](https://lit.fe.uni-lj.si/en/research/resources/3D-MR-MS/) ([Lesjak et al. 2018](https://doi.org/10.1007/s12021-017-9348-7)) | 30 | 3D, 0.8 × 0.47 × 0.47 mm; 3T Siemens | 3-rater consensus lesion mask |
+| [MSLesSeg](https://doi.org/10.6084/m9.figshare.27919209) ([Guarnera et al. 2025](https://doi.org/10.1038/s41597-025-05250-y)) | 70 of 75 | first native scan, mostly 2D with 2.3-5 mm slices; Philips, GE and Siemens at 1.5T and 3T | lesion mask, drawn in MNI space |
+
+`ms_flair_lesions` segments the lesions, with patients from all three sources in every CV fold, and reports:
+- dice;
+- lesion-wise detection (26-connected components, detected on any overlap): per-subject lesion F1, sensitivity by lesion size, false positive lesions per scan and lesion count r.
+
+The images are the released FLAIRs (symlinks); [make_dataset.py](datasets/ms/make_dataset.py) only touches labels, writing every mask as uint8 0/1 on its FLAIR grid (MS3SEG releases 0/255). Most 3D-MR-MS masks put the origin half a voxel off the FLAIR's, so they are rewritten with the FLAIR's affine. MSLesSeg's masks were drawn on FLAIRs registered to MNI152 1 mm (FSL flirt), so each is mapped back to the native grid with the released flirt matrix; the five patients whose raw FLAIR doesn't match its matrix (correlation < 0.95 with the released registered FLAIR) are left out. Brain masks are SynthSeg 2.0 `--robust` on each FLAIR, cut to the nonzero voxels on the MSLesSeg FLAIRs released skull stripped.
+
+```bash
+uv run python datasets/ms/make_dataset.py $DURA_DATA_ROOT/ms --ms3seg /data/mihir-stuff/ms3seg \
+    --ljubljana /data/mihir-stuff/ms_raw/3D-MR-MS --mslesseg /data/mihir-stuff/ms_raw/MSLesSeg
+uv run python datasets/ms/make_brain_masks.py   # SynthSeg --robust, GPU, or --cpu
 ```
 
 **adni**: [ADNI](https://adni.loni.usc.edu) 3T scans from ADNIGO to ADNI4, converted from the DICOMs with dcm2niix, with labels from the ADNIMERGE2 tables of the 18 Jun 2026 download. ADNI1 is left out: it is mostly 1.5T and has no FLAIR. Each task has its own 500 subjects with one scan each, except the five anatomy tasks, which segment the diagnosis subjects: 1,225 subjects in all. ADNI's diagnosis comes from the same cognitive tests a clinician already has, so it is only a sanity check. The other tasks are things MRI itself shows: prognosis, small vessel disease and atrophy of the regions that separate Alzheimer's disease from normal aging.

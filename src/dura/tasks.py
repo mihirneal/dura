@@ -67,6 +67,31 @@ def ucsf_bmsr_flair_edema() -> Probe:
     return ucsf_bmsr_label("flair", UCSF_EDEMA)
 
 
+def ms_samples() -> list[dict[str, Any]]:
+    """One FLAIR per patient with its MS lesion mask on the same grid."""
+    root = DATA_ROOT / "ms"
+    subjects = sorted((root / "images").glob("sub-*"))
+    assert subjects, f"no subjects in {root / 'images'}"
+    return [
+        {
+            "subject": sub.name.removeprefix("sub-"),
+            "image": sub / "flair.nii.gz",
+            "label": root / "labels" / sub.name / "ms_lesions.nii.gz",
+        }
+        for sub in subjects
+    ]
+
+
+def ms_flair_lesions() -> Probe:
+    return partial(
+        probe_binary_segmentation,
+        samples=ms_samples(),
+        label_fn=partial(select_labels, label_ids=(1,)),
+        max_negative_ratio=MAX_NEGATIVE_RATIO,
+        lesion_metrics=True,
+    )
+
+
 def adni_samples(task: str, target_type: type = float) -> list[dict[str, Any]]:
     """One subject per row of DATA_ROOT/adni/<task>.tsv: its image and label, relative to
     DATA_ROOT/adni, or its target."""
@@ -140,6 +165,7 @@ TASKS: dict[str, Callable[[], Probe]] = {
         ucsf_bmsr_t1c_enhancing,
         ucsf_bmsr_t1c_edema,
         ucsf_bmsr_flair_edema,
+        ms_flair_lesions,
         adni_diagnosis,
         adni_hippocampus,
         adni_amygdala,
@@ -156,6 +182,7 @@ HEADLINE_METRICS: dict[str, str] = {
     "ucsf_bmsr_t1c_enhancing": "dice",
     "ucsf_bmsr_t1c_edema": "dice",
     "ucsf_bmsr_flair_edema": "dice",
+    "ms_flair_lesions": "dice",
     # macro one-vs-rest
     "adni_diagnosis": "auroc",
     "adni_hippocampus": "dice",
