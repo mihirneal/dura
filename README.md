@@ -43,6 +43,7 @@ Brain masks live in `DURA_DATA_ROOT/brain_masks/<image path relative to DURA_DAT
 | ms | `ms_flair_lesions` | dice, lesion F1 |
 | stroke | `stroke_dwi_infarct` | dice, lesion F1 |
 | microbleeds | `microbleeds_segmentation` | dice, lesion F1 |
+| vestibular_schwannoma | `vs_segmentation` | dice |
 | adni | `adni_diagnosis`, `adni_mci_conversion`, `adni_wmh_flair`, `adni_wmh_t1`, `adni_hippocampus`, `adni_amygdala`, `adni_temporal_horns`, `adni_lateral_ventricles`, `adni_cortex` | AUROC, R², dice |
 
 **ucsf_bmsr**: [UCSF-BMSR](https://imagingdatasets.ucsf.edu/dataset/1) v1.3 ([Rudie et al. 2024](https://doi.org/10.1148/ryai.230126)), brain metastasis segmentation. 199 visits, one per patient, with T1post, FLAIR and the BraTS-METS 2023 labels. Each task segments one label: enhancing tumor on T1c, and edema on T1c and on FLAIR. Enhancing tumor is also scored lesion-wise like `ms_flair_lesions`, since the number of metastases matters and small ones barely move dice.
@@ -109,6 +110,24 @@ uv run --with openpyxl --with pyreadr python datasets/microbleeds/make_dataset.p
     --adni-nifti /data/mihir-stuff/adni_gre/nifti \
     --adni-reads /data/smri-datasets/ADNI/metadata/Tables_18Jun2026/ADNIMERGE2/data/MAYOADIRL_MRI_MCH.rda
 uv run python datasets/microbleeds/make_brain_masks.py   # SynthStrip on CPU, mri_synthstrip on PATH
+```
+
+**vestibular_schwannoma**: vestibular schwannoma (acoustic neuroma) on contrast enhanced T1. The tumor grows from the vestibular nerve in the bony ear canal and pushes into the cistern beside the brainstem, so it lies outside the brain. Most tumors are small, a median 1 mL, about 15 patches of 4 mm.
+
+| Source | People | Scan | Labels |
+|---|---|---|---|
+| [crossMoDA 2022](https://crossmoda2022.grand-challenge.org) training source (London, Tilburg) | 210 | ceT1, 0.4 × 0.4 × 1.5 mm (London) and 0.8 × 0.8 × 1.5 mm (Tilburg), whole head | tumor masks (the cochlea label is dropped), 28 after surgery |
+| VS-MC-RC2 (TCIA, Oct 2025 metadata) | 185, 534 scans | T1C from routine follow-up, 87% a slab under 80 mm thick over the ear canals, mostly 1.5T, Siemens, GE and Philips | tumor masks |
+
+- `vs_segmentation` segments the tumor on one scan per person, 395 in all: every crossMoDA scan and each VS-MC-RC2 patient's first, scored by dice and the predicted volume against the label's.
+- Brain masks are [SynthStrip](https://synthstrip.io) 1.8 on each scan (`mri_synthstrip` from FreeSurfer or the `freesurfer/synthstrip:1.8` image, on CPU), widened by 10 mm and cut to the scan's nonzero voxels with their holes filled. SynthStrip alone keeps on average 55% of each tumor and none of those under 0.1 mL; widened, it keeps every tumor.
+- In 3 of the 395 scans part of the mask lies where the image is 0 (beyond the slab), so up to 13% of their tumor can't be seen.
+- `scans.tsv` lists every scan with its tumor volume. The VS-MC-RC2 follow-up scans are kept for a growth task, which is on hold: between consecutive untreated visits 18% of the tumors measure at least 20% smaller even when the slice thickness stays the same, while untreated vestibular schwannomas rarely shrink, so a growth label from these masks would mostly be measurement error.
+
+```bash
+uv run python datasets/vestibular_schwannoma/make_dataset.py /data/mihir-stuff/crossmoda2022 \
+    /data/mihir-stuff/tumor_raw/Vestibular-Schwannoma-MC-RC2 $DURA_DATA_ROOT/vestibular_schwannoma
+uv run python datasets/vestibular_schwannoma/make_brain_masks.py   # SynthStrip on CPU, mri_synthstrip on PATH
 ```
 
 **adni**: [ADNI](https://adni.loni.usc.edu) 3T scans from ADNIGO to ADNI4, converted from the DICOMs with dcm2niix, with labels from the ADNIMERGE2 tables of the 18 Jun 2026 download. ADNI1 is left out: it is mostly 1.5T and has no FLAIR. Each task has its own 500 subjects with one scan each, except the five anatomy tasks, which segment the diagnosis subjects: 1,225 subjects in all. ADNI's diagnosis comes from the same cognitive tests a clinician already has, so it is only a sanity check. The other tasks are things MRI itself shows: prognosis, small vessel disease and atrophy of the regions that separate Alzheimer's disease from normal aging.
