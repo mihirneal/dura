@@ -41,6 +41,7 @@ Brain masks live in `DURA_DATA_ROOT/brain_masks/<image path relative to DURA_DAT
 |---|---|---|
 | ucsf_bmsr | `ucsf_bmsr_t1c_enhancing`, `ucsf_bmsr_t1c_edema`, `ucsf_bmsr_flair_edema` | dice; lesion F1 on enhancing |
 | ms | `ms_flair_lesions` | dice, lesion F1 |
+| stroke | `stroke_dwi_infarct` | dice, lesion F1 |
 | adni | `adni_diagnosis`, `adni_mci_conversion`, `adni_wmh_flair`, `adni_wmh_t1`, `adni_hippocampus`, `adni_amygdala`, `adni_temporal_horns`, `adni_lateral_ventricles`, `adni_cortex` | AUROC, R², dice |
 
 **ucsf_bmsr**: [UCSF-BMSR](https://imagingdatasets.ucsf.edu/dataset/1) v1.3 ([Rudie et al. 2024](https://doi.org/10.1148/ryai.230126)), brain metastasis segmentation. 199 visits, one per patient, with T1post, FLAIR and the BraTS-METS 2023 labels. Each task segments one label: enhancing tumor on T1c, and edema on T1c and on FLAIR. Enhancing tumor is also scored lesion-wise like `ms_flair_lesions`, since the number of metastases matters and small ones barely move dice.
@@ -68,6 +69,23 @@ The images are the released FLAIRs (symlinks); [make_dataset.py](datasets/ms/mak
 uv run python datasets/ms/make_dataset.py $DURA_DATA_ROOT/ms --ms3seg /data/mihir-stuff/ms3seg \
     --ljubljana /data/mihir-stuff/ms_raw/3D-MR-MS --mslesseg /data/mihir-stuff/ms_raw/MSLesSeg
 uv run python datasets/ms/make_brain_masks.py   # SynthSeg --robust, GPU, or --cpu
+```
+
+**stroke**: acute ischemic infarcts on DWI (b1000), 495 patients with one scan each, from two releases. Every patient has an infarct.
+
+| Source | Patients | DWI | Labels |
+|---|---|---|---|
+| [ISLES 2022](https://zenodo.org/record/7153326) ([Hernandez Petzsche et al. 2022](https://doi.org/10.1038/s41597-022-01875-5)) | 245 of 250 | mostly 2 mm isotropic, some 4.8 mm slices; 3 centers | expert infarct mask; median 7.2 mL (IQR 2.1-24) |
+| [SOOP](https://openneuro.org/datasets/ds004889) ([Absher et al. 2024](https://doi.org/10.1038/s41597-024-03667-5)) | 250 of 253 | TRACE, 0.6-1.1 mm in-plane, 6 mm slices; one stroke center | acute lesion mask; median 8.4 mL (IQR 1.7-32) |
+
+`stroke_dwi_infarct` segments the infarct, with patients from both sources in every CV fold, and reports dice and the lesion-wise detection of `ms_flair_lesions`.
+
+The SOOP patients are [soop_manifest.txt](datasets/stroke/soop_manifest.txt): 253 with an acute lesion mask, stratified by lesion volume, none in the nanobrain pretraining split. Left out after review: ISLES cases with empty masks or lesions not bright on DWI, and SOOP patients whose lesion is not bright on DWI, whose chronic infarct is labeled acute, or whose acute and chronic masks are identical. SOOP's chronic infarct masks are not labels: an old infarct is not bright on DWI. The ISLES DWIs are symlinked as released; the SOOP TRACE is written squeezed (it is released with a trailing singleton axis). Masks are written as uint8 0/1 on the DWI grid. Brain masks are SynthStrip 1.8 on each DWI, on CPU.
+
+```bash
+uv run python datasets/stroke/make_dataset.py $DURA_DATA_ROOT/stroke \
+    --isles /data/smri-datasets/ISLES-2022 --soop /data/connor/brain_datasets/datasets/soop/source
+uv run python datasets/stroke/make_brain_masks.py   # SynthStrip 1.8, CPU; --shard i/n per slurm job
 ```
 
 **adni**: [ADNI](https://adni.loni.usc.edu) 3T scans from ADNIGO to ADNI4, converted from the DICOMs with dcm2niix, with labels from the ADNIMERGE2 tables of the 18 Jun 2026 download. ADNI1 is left out: it is mostly 1.5T and has no FLAIR. Each task has its own 500 subjects with one scan each, except the five anatomy tasks, which segment the diagnosis subjects: 1,225 subjects in all. ADNI's diagnosis comes from the same cognitive tests a clinician already has, so it is only a sanity check. The other tasks are things MRI itself shows: prognosis, small vessel disease and atrophy of the regions that separate Alzheimer's disease from normal aging.
